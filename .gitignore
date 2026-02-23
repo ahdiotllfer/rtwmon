@@ -1,0 +1,9 @@
+rtl8821au_libusb.c
+
+*.o
+*.a
+*.so
+*.so.*
+
+rtl8188eu_libusb
+rtl8821au_libusb
