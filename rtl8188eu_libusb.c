@@ -1190,6 +1190,10 @@ static void on_signal(int signum) {
     g_stop = 1;
 }
 
+static void dump_hex(FILE *fp, const uint8_t *buf, size_t n) {
+    for (size_t i = 0; i < n; i++) fprintf(fp, "%02x", buf[i]);
+}
+
 static bool parse_mac_addr(const char *s, uint8_t out[6]) {
     if (!s) return false;
     char hex[12];
@@ -1304,7 +1308,7 @@ static uint8_t select_tx_ep(rtl8188eu_t *d, const uint8_t *payload, size_t paylo
     return d->ep_out_eps[d->ep_out_len - 1];
 }
 
-static int tx_frame(rtl8188eu_t *d, const uint8_t *payload, size_t payload_len, int timeout_ms) {
+static int tx_frame(rtl8188eu_t *d, const uint8_t *payload, size_t payload_len, int timeout_ms, bool debug, int dump_bytes) {
     uint8_t desc[32];
     build_tx_desc32(payload, payload_len, DESC_RATE_6M, desc);
 
@@ -1317,6 +1321,50 @@ static int tx_frame(rtl8188eu_t *d, const uint8_t *payload, size_t payload_len, 
     int transferred = 0;
     int r = libusb_bulk_transfer(d->handle, ep, data, (int)total, &transferred, timeout_ms);
     free(data);
+
+    if (debug) {
+        uint16_t pkt_size = le16(desc + 0);
+        uint8_t pkt_offset = desc[2];
+        uint8_t txdw0 = desc[3];
+        uint32_t txdw1 = le32(desc + 4);
+        uint32_t txdw2 = le32(desc + 8);
+        uint32_t txdw3 = le32(desc + 12);
+        uint32_t txdw4 = le32(desc + 16);
+        uint32_t txdw5 = le32(desc + 20);
+        uint32_t txdw6 = le32(desc + 24);
+        uint16_t csum = le16(desc + 28);
+        uint16_t txdw7 = le16(desc + 30);
+        fprintf(stderr, "TX: ep=0x%02x total=%zu transferred=%d timeout_ms=%d r=%s\n",
+                ep, total, transferred, timeout_ms, libusb_error_name(r));
+        fprintf(stderr,
+                "TX: desc pkt_size=%u pkt_offset=%u txdw0=0x%02x txdw1=0x%08x txdw2=0x%08x txdw3=0x%08x txdw4=0x%08x txdw5=0x%08x txdw6=0x%08x csum=0x%04x txdw7=0x%04x\n",
+                (unsigned)pkt_size, (unsigned)pkt_offset, (unsigned)txdw0, txdw1, txdw2, txdw3, txdw4, txdw5, txdw6, (unsigned)csum, (unsigned)txdw7);
+
+        if (payload_len >= 26) {
+            uint16_t fc = le16(payload + 0);
+            uint16_t dur = le16(payload + 2);
+            char da_s[18], sa_s[18], bssid_s[18];
+            fmt_mac(payload + 4, da_s);
+            fmt_mac(payload + 10, sa_s);
+            fmt_mac(payload + 16, bssid_s);
+            uint16_t seq_ctrl = le16(payload + 22);
+            uint16_t reason = le16(payload + 24);
+            fprintf(stderr, "TX: 80211 fc=0x%04x dur=0x%04x da=%s sa=%s bssid=%s seq=%u reason=%u\n",
+                    (unsigned)fc, (unsigned)dur, da_s, sa_s, bssid_s, (unsigned)((seq_ctrl >> 4) & 0x0FFF), (unsigned)reason);
+        }
+
+        if (dump_bytes > 0) {
+            int dn = dump_bytes;
+            if (dn > (int)payload_len) dn = (int)payload_len;
+            fprintf(stderr, "TX: desc_hex=");
+            dump_hex(stderr, desc, 32);
+            fprintf(stderr, "\n");
+            fprintf(stderr, "TX: payload_hex=");
+            dump_hex(stderr, payload, (size_t)dn);
+            fprintf(stderr, "\n");
+        }
+    }
+
     if (r != 0) return r;
     if (transferred != (int)total) return LIBUSB_ERROR_IO;
     return 0;
@@ -1351,7 +1399,9 @@ static void deauth_burst_loop(
     int read_size,
     bool include_bad_fcs,
     bool keep_fcs,
-    int tx_timeout_ms
+    int tx_timeout_ms,
+    bool debug,
+    int tx_dump_bytes
 ) {
     pcap_write_global_header(fp, 127, 65535);
     uint8_t *buf = (uint8_t *)xmalloc((size_t)read_size);
@@ -1359,6 +1409,11 @@ static void deauth_burst_loop(
     uint64_t end = burst_duration_s > 0 ? start + (uint64_t)burst_duration_s * 1000u : 0;
     uint64_t next_burst = start;
     int reads = 0;
+    uint64_t sent = 0;
+    uint64_t tx_ok = 0;
+    uint64_t tx_err = 0;
+    uint64_t written = 0;
+    uint64_t next_status = start + 1000u;
 
     while (!g_stop) {
         uint64_t now = now_ms();
@@ -1369,7 +1424,10 @@ static void deauth_burst_loop(
                 uint8_t frame[64];
                 size_t flen = build_deauth_frame(target_mac, source_mac, bssid, d->tx_seq, reason, frame);
                 d->tx_seq = (uint16_t)((d->tx_seq + 1) & 0x0FFFu);
-                (void)tx_frame(d, frame, flen, tx_timeout_ms);
+                int tr = tx_frame(d, frame, flen, tx_timeout_ms, debug, tx_dump_bytes);
+                sent++;
+                if (tr == 0) tx_ok++;
+                else tx_err++;
                 if (g_stop) break;
             }
             next_burst = now_ms() + (uint64_t)burst_interval_ms;
@@ -1428,6 +1486,7 @@ static void deauth_burst_loop(
                         memcpy(pkt + rtap_len, frame, frame_len);
                         pcap_write_packet(fp, pkt, total);
                         free(pkt);
+                        written++;
                     }
                 }
             }
@@ -1437,6 +1496,15 @@ static void deauth_burst_loop(
             if (pkt_cnt <= 0) break;
         }
         fflush(fp);
+
+        if (debug) {
+            uint64_t t = now_ms();
+            if (t >= next_status) {
+                fprintf(stderr, "deauth-burst: sent=%" PRIu64 " ok=%" PRIu64 " err=%" PRIu64 " rx_reads=%d pcap_written=%" PRIu64 "\n",
+                        sent, tx_ok, tx_err, reads, written);
+                next_status = t + 1000u;
+            }
+        }
     }
 
     free(buf);
@@ -2076,6 +2144,7 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s [options]\n"
         "  -h, --help                  show help\n"
+        "  --debug                     verbose debug to stderr\n"
         "  --vid <int>                 default 0x2357\n"
         "  --pid <int>                 default 0x010C\n"
         "  --bus <int>                 optional USB bus number\n"
@@ -2105,6 +2174,8 @@ static void usage(const char *prog) {
         "  --burst-interval-ms <int>   with --deauth-burst, delay between bursts (default 1000)\n"
         "  --burst-duration-s <int>    with --deauth-burst, total duration (0 = until Ctrl-C)\n"
         "  --burst-read-timeout-ms <int>  with --deauth-burst, USB read timeout (default 50)\n"
+        "  --tx-timeout-ms <int>       with --deauth-burst, USB write timeout (default 100)\n"
+        "  --tx-dump-bytes <int>       with --debug, dump first N TX payload bytes\n"
         "  --reads <int>               default 0 (unlimited)\n"
         "  --read-size <int>           default 16384\n"
         "  --timeout-ms <int>          default 1000\n"
@@ -2116,6 +2187,7 @@ static void usage(const char *prog) {
 
 int main(int argc, char **argv) {
     const char *prog = "rtl8188eu_libusb";
+    bool debug = false;
     uint16_t vid = 0x2357;
     uint16_t pid = 0x010C;
     int bus = -1;
@@ -2145,6 +2217,8 @@ int main(int argc, char **argv) {
     int burst_interval_ms = 1000;
     int burst_duration_s = 0;
     int burst_read_timeout_ms = 50;
+    int tx_timeout_ms = 100;
+    int tx_dump_bytes = 0;
     int reads = 0;
     int read_size = 16384;
     int timeout_ms = 1000;
@@ -2153,6 +2227,7 @@ int main(int argc, char **argv) {
 
     static struct option long_opts[] = {
         {"help", no_argument, 0, 'h'},
+        {"debug", no_argument, 0, 35},
         {"vid", required_argument, 0, 1},
         {"pid", required_argument, 0, 2},
         {"bus", required_argument, 0, 3},
@@ -2182,6 +2257,8 @@ int main(int argc, char **argv) {
         {"burst-interval-ms", required_argument, 0, 32},
         {"burst-duration-s", required_argument, 0, 33},
         {"burst-read-timeout-ms", required_argument, 0, 34},
+        {"tx-timeout-ms", required_argument, 0, 36},
+        {"tx-dump-bytes", required_argument, 0, 37},
         {"reads", required_argument, 0, 20},
         {"read-size", required_argument, 0, 21},
         {"timeout-ms", required_argument, 0, 22},
@@ -2196,6 +2273,7 @@ int main(int argc, char **argv) {
         if (c == -1) break;
         switch (c) {
             case 'h': usage(prog); return 0;
+            case 35: debug = true; break;
             case 1: vid = (uint16_t)strtoul(optarg, NULL, 0); break;
             case 2: pid = (uint16_t)strtoul(optarg, NULL, 0); break;
             case 3: bus = (int)strtoul(optarg, NULL, 0); break;
@@ -2225,6 +2303,8 @@ int main(int argc, char **argv) {
             case 32: burst_interval_ms = atoi(optarg); break;
             case 33: burst_duration_s = atoi(optarg); break;
             case 34: burst_read_timeout_ms = atoi(optarg); break;
+            case 36: tx_timeout_ms = atoi(optarg); break;
+            case 37: tx_dump_bytes = atoi(optarg); break;
             case 20: reads = atoi(optarg); break;
             case 21: read_size = atoi(optarg); break;
             case 22: timeout_ms = atoi(optarg); break;
@@ -2243,6 +2323,8 @@ int main(int argc, char **argv) {
     if (burst_interval_ms < 0) die("burst-interval-ms must be >= 0");
     if (burst_duration_s < 0) die("burst-duration-s must be >= 0");
     if (burst_read_timeout_ms < 0) die("burst-read-timeout-ms must be >= 0");
+    if (tx_timeout_ms < 0) die("tx-timeout-ms must be >= 0");
+    if (tx_dump_bytes < 0) die("tx-dump-bytes must be >= 0");
     if (reason < 0 || reason > 65535) die("reason must be 0..65535");
 
     if (optind < argc) {
@@ -2267,6 +2349,12 @@ int main(int argc, char **argv) {
 
     open_device(&dev, vid, pid, bus, address, usb_fd);
     init_device(&dev, firmware_path, channel, bw);
+
+    if (debug) {
+        fprintf(stderr, "USB: intf=%d ep_in=0x%02x bulk_out=%d", dev.intf_num, dev.ep_in, dev.ep_out_len);
+        for (int i = 0; i < dev.ep_out_len; i++) fprintf(stderr, " ep_out[%d]=0x%02x", i, dev.ep_out_eps[i]);
+        fprintf(stderr, "\n");
+    }
 
     if (init_only) {
         close_device(&dev);
@@ -2334,7 +2422,9 @@ int main(int argc, char **argv) {
             read_size,
             pcap_include_bad_fcs,
             pcap_with_fcs,
-            timeout_ms
+            tx_timeout_ms,
+            debug,
+            tx_dump_bytes
         );
 
         if (fp != stdout) fclose(fp);
