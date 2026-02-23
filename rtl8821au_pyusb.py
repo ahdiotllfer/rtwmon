@@ -63,8 +63,15 @@ def _open_device_from_usb_fd(usb_fd: int) -> usb.core.Device:
     if not dev_ptr:
         raise RuntimeError("libusb_get_device returned NULL device")
 
-    dev = usb.core.Device(dev_ptr, backend)
-    dev._ctx.handle = handle
+    dev_id = libusb1._Device(dev_ptr)
+    dev = usb.core.Device(dev_id, backend)
+
+    class _WrappedHandle:
+        def __init__(self, *, handle, devid):
+            self.handle = handle
+            self.devid = devid
+
+    dev._ctx.handle = _WrappedHandle(handle=handle, devid=dev_id.devid)
     return dev
 
 
