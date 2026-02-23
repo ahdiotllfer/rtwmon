@@ -15,6 +15,59 @@ import usb.core
 import usb.util
 
 
+def _libusb_error_name(lib, code: int) -> str:
+    try:
+        f = getattr(lib, "libusb_error_name", None)
+        if f is None:
+            return str(int(code))
+        import ctypes
+
+        f.argtypes = [ctypes.c_int]
+        f.restype = ctypes.c_char_p
+        s = f(int(code))
+        if isinstance(s, (bytes, bytearray)):
+            return s.decode("utf-8", errors="replace")
+        if s is None:
+            return str(int(code))
+        return str(s)
+    except Exception:
+        return str(int(code))
+
+
+def _open_device_from_usb_fd(usb_fd: int) -> usb.core.Device:
+    import ctypes
+    import usb.backend.libusb1 as libusb1
+
+    backend = libusb1.get_backend()
+    lib = backend.lib
+
+    wrap = getattr(lib, "libusb_wrap_sys_device", None)
+    if wrap is None:
+        raise RuntimeError("libusb_wrap_sys_device not available (need libusb >= 1.0.23)")
+    wrap.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    wrap.restype = ctypes.c_int
+
+    handle = ctypes.c_void_p()
+    r = int(wrap(backend.ctx, ctypes.c_void_p(int(usb_fd)), ctypes.byref(handle)))
+    if r != 0:
+        raise RuntimeError(f"libusb_wrap_sys_device failed: {_libusb_error_name(lib, r)}")
+    if not handle:
+        raise RuntimeError("libusb_wrap_sys_device returned NULL handle")
+
+    get_dev = getattr(lib, "libusb_get_device", None)
+    if get_dev is None:
+        raise RuntimeError("libusb_get_device not available")
+    get_dev.argtypes = [ctypes.c_void_p]
+    get_dev.restype = ctypes.c_void_p
+    dev_ptr = ctypes.c_void_p(get_dev(handle))
+    if not dev_ptr:
+        raise RuntimeError("libusb_get_device returned NULL device")
+
+    dev = usb.core.Device(dev_ptr, backend)
+    dev._ctx.handle = handle
+    return dev
+
+
 REALTEK_USB_VENQT_READ = 0xC0
 REALTEK_USB_VENQT_WRITE = 0x40
 REALTEK_USB_VENQT_CMD_REQ = 0x05
@@ -407,10 +460,18 @@ class Rtl8821auUsb:
         self.bulk_in_eps = sorted(bulk_in, key=lambda e: e.bEndpointAddress)
         self.bulk_out_eps = sorted(bulk_out, key=lambda e: e.bEndpointAddress)
 
-    def open(self, *, interface: int = 0, configuration: int = 1) -> None:
-        dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
-        if dev is None:
-            raise RuntimeError(f"USB device {self.vid:04x}:{self.pid:04x} not found")
+    def open(self, *, interface: int = 0, configuration: int = 1, usb_fd: Optional[int] = None) -> None:
+        if usb_fd is not None and int(usb_fd) >= 0:
+            dev = _open_device_from_usb_fd(int(usb_fd))
+            if int(getattr(dev, "idVendor", 0)) != int(self.vid) or int(getattr(dev, "idProduct", 0)) != int(self.pid):
+                raise RuntimeError(
+                    f"USB FD device mismatch: got {int(getattr(dev, 'idVendor', 0)):04x}:{int(getattr(dev, 'idProduct', 0)):04x} "
+                    f"want {int(self.vid):04x}:{int(self.pid):04x}"
+                )
+        else:
+            dev = usb.core.find(idVendor=self.vid, idProduct=self.pid)
+            if dev is None:
+                raise RuntimeError(f"USB device {self.vid:04x}:{self.pid:04x} not found")
 
         self.dev = dev
 
@@ -2162,6 +2223,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--pid", type=_parse_int, default=0x0120)
     ap.add_argument("--interface", type=int, default=0)
     ap.add_argument("--configuration", type=int, default=1)
+    ap.add_argument("--usb-fd", type=int, default=-1)
 
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -2344,10 +2406,27 @@ def main(argv: list[str]) -> int:
     p_replay.add_argument("--report-errors", type=int, default=0)
     p_replay.add_argument("--debug", action="store_true")
 
-    args = ap.parse_args(argv)
+    args, extra = ap.parse_known_args(argv)
+    if extra:
+        if (
+            len(extra) == 1
+            and extra[0] == argv[-1]
+            and re.fullmatch(r"[0-9]+", extra[0]) is not None
+            and int(getattr(args, "usb_fd", -1)) < 0
+        ):
+            usb_fd_auto = int(extra[0], 10)
+            args = ap.parse_args(argv[:-1])
+            args.usb_fd = usb_fd_auto
+        else:
+            ap.error("unrecognized arguments: " + " ".join(extra))
     dev = Rtl8821auUsb(vid=args.vid, pid=args.pid)
     if args.cmd != "replay" or not getattr(args, "dry_run", False):
-        dev.open(interface=args.interface, configuration=args.configuration)
+        usb_fd = int(getattr(args, "usb_fd", -1))
+        dev.open(
+            interface=args.interface,
+            configuration=args.configuration,
+            usb_fd=(usb_fd if usb_fd >= 0 else None),
+        )
 
     try:
         def _autodetect_fw_path() -> Optional[Path]:

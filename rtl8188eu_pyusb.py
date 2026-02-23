@@ -1576,7 +1576,7 @@ class RTL8188EU:
         debug: Optional[bool] = None,
         dump_bytes: Optional[int] = None,
         timeout_ms: Optional[int] = None,
-    ) -> None:
+    ) -> bool:
         if not self.bulk_out_eps:
             raise RuntimeError("No bulk OUT endpoints")
 
@@ -1589,68 +1589,54 @@ class RTL8188EU:
         dump_n = self.tx_dump_bytes if dump_bytes is None else int(dump_bytes)
         timeout = self.tx_timeout_ms if timeout_ms is None else int(timeout_ms)
 
+        wrote = 0
+        r_s = "OK"
+        ok = True
+        try:
+            wrote = self.dev.write(ep, data, timeout=timeout)
+        except Exception as e:
+            wrote = 0
+            r_s = repr(e)
+            ok = False
+        finally:
+            self.tx_frame_counter += 1
+
         if do_debug:
-            tx_id = self.tx_frame_counter
             sys.stderr.write(
-                f"TX[{tx_id}]: ep=0x{ep:02x} total={len(data)} desc={len(desc)} payload={len(payload)} "
-                f"rate_id=0x{rate_id:02x} timeout_ms={timeout}\n"
+                f"TX: ep=0x{ep:02x} total={len(data)} transferred={int(wrote)} timeout_ms={timeout} r={r_s}\n"
             )
             if len(desc) == 32:
                 pkt_size, pkt_offset, txdw0, txdw1, txdw2, txdw3, txdw4, txdw5, txdw6, csum, txdw7 = (
                     struct.unpack("<HBBIIIIIIHH", desc)
                 )
                 sys.stderr.write(
-                    f"TX[{tx_id}]: desc"
-                    f" pkt_size={pkt_size}"
-                    f" pkt_offset={pkt_offset}"
-                    f" txdw0=0x{txdw0:02x}"
-                    f" txdw1=0x{txdw1:08x}"
-                    f" txdw2=0x{txdw2:08x}"
-                    f" txdw3=0x{txdw3:08x}"
-                    f" txdw4=0x{txdw4:08x}"
-                    f" txdw5=0x{txdw5:08x}"
-                    f" txdw6=0x{txdw6:08x}"
-                    f" csum=0x{csum:04x}"
-                    f" txdw7=0x{txdw7:04x}\n"
+                    f"TX: desc pkt_size={pkt_size} pkt_offset={pkt_offset} txdw0=0x{txdw0:02x} txdw1=0x{txdw1:08x} txdw2=0x{txdw2:08x} txdw3=0x{txdw3:08x} txdw4=0x{txdw4:08x} txdw5=0x{txdw5:08x} txdw6=0x{txdw6:08x} csum=0x{csum:04x} txdw7=0x{txdw7:04x}\n"
                 )
-            if len(payload) >= 2:
+
+            if len(payload) >= 26:
                 fc = int.from_bytes(payload[0:2], "little")
-                ftype, subtype, to_ds, from_ds, more_frag, retry, pwr_mgt, more_data, protected, order = _decode_fc(
+                ftype, subtype, _to_ds, _from_ds, _more_frag, _retry, _pwr_mgt, _more_data, _protected, _order = _decode_fc(
                     fc
                 )
-                a1, a2, a3, a4, _ftype2, _subtype2, seq = _parse_addrs(payload)
-                if ftype in (0, 2):
-                    seq_num = (seq >> 4) & 0xFFF
-                    frag_num = seq & 0xF
+                if ftype == 0 and subtype in (10, 12):
+                    dur = int.from_bytes(payload[2:4], "little")
+                    da = payload[4:10]
+                    sa = payload[10:16]
+                    bssid = payload[16:22]
+                    seq_ctrl = int.from_bytes(payload[22:24], "little")
+                    reason = struct.unpack_from("<H", payload, 24)[0]
                     sys.stderr.write(
-                        f"TX[{tx_id}]: 802.11 fc=0x{fc:04x} type={_fc_type_subtype_name(ftype, subtype)}"
-                        f" to_ds={int(to_ds)} from_ds={int(from_ds)} retry={int(retry)} protected={int(protected)}"
-                        f" seq={seq_num} frag={frag_num}"
-                        f" a1={_fmt_mac(a1) if a1 else '??'}"
-                        f" a2={_fmt_mac(a2) if a2 else '??'}"
-                        f" a3={_fmt_mac(a3) if a3 else '??'}"
-                        f" a4={_fmt_mac(a4) if a4 else ''}\n"
+                        f"TX: 80211 fc=0x{fc:04x} dur=0x{dur:04x} da={_fmt_mac(da)} sa={_fmt_mac(sa)} bssid={_fmt_mac(bssid)} seq={(seq_ctrl >> 4) & 0x0FFF} reason={reason}\n"
                     )
-                    if ftype == 0 and subtype in (10, 12) and len(payload) >= 26:
-                        reason = struct.unpack_from("<H", payload, 24)[0]
-                        sys.stderr.write(f"TX[{tx_id}]: mgmt reason={reason}\n")
+
             if dump_n > 0:
-                sys.stderr.write(f"TX[{tx_id}]: desc_hex={desc.hex()}\n")
+                sys.stderr.write(f"TX: desc_hex={desc.hex()}\n")
                 dump_payload = payload[: min(len(payload), dump_n)]
-                sys.stderr.write(f"TX[{tx_id}]: payload_hex={dump_payload.hex()}\n")
+                sys.stderr.write(f"TX: payload_hex={dump_payload.hex()}\n")
 
-        try:
-            wrote = self.dev.write(ep, data, timeout=timeout)
-            if do_debug:
-                sys.stderr.write(f"TX[{tx_id}]: wrote={int(wrote)}\n")
-        except Exception as e:
-            sys.stderr.write(f"TX failed: {e!r}\n")
-            if do_debug:
-                sys.stderr.write(f"TX[{tx_id}]: failed ep=0x{ep:02x} total={len(data)}\n")
-        finally:
-            self.tx_frame_counter += 1
+        return ok
 
-    def send_disassoc(self, dest: str, bssid: str, source: Optional[str] = None, reason: int = 8) -> None:
+    def send_disassoc(self, dest: str, bssid: str, source: Optional[str] = None, reason: int = 8) -> bool:
         if source is None:
             source = bssid
         
@@ -1674,9 +1660,9 @@ class RTL8188EU:
         body = struct.pack("<H", reason)
         
         payload = header + body
-        self.send_packet(payload)
+        return self.send_packet(payload)
 
-    def send_deauth(self, dest: str, bssid: str, source: Optional[str] = None, reason: int = 7) -> None:
+    def send_deauth(self, dest: str, bssid: str, source: Optional[str] = None, reason: int = 7) -> bool:
         if source is None:
             source = bssid
         
@@ -1700,7 +1686,7 @@ class RTL8188EU:
         body = struct.pack("<H", reason)
         
         payload = header + body
-        self.send_packet(payload)
+        return self.send_packet(payload)
 
     def deauth_burst_capture_pcap(
         self,
@@ -1731,8 +1717,12 @@ class RTL8188EU:
         next_send = start
 
         sent = 0
+        tx_ok = 0
+        tx_err = 0
+        rx_reads = 0
         written = 0
         bssid_bytes = bytes.fromhex(bssid.replace(":", "").replace("-", ""))
+        next_status = start + 1.0
 
         while True:
             now = time.monotonic()
@@ -1741,8 +1731,11 @@ class RTL8188EU:
 
             if now >= next_send:
                 for _ in range(burst_size):
-                    self.send_deauth(dest=dest, bssid=bssid, source=source, reason=reason)
                     sent += 1
+                    if self.send_deauth(dest=dest, bssid=bssid, source=source, reason=reason):
+                        tx_ok += 1
+                    else:
+                        tx_err += 1
                 next_send += interval_ms / 1000.0
                 if next_send < now:
                     next_send = now + (interval_ms / 1000.0)
@@ -1752,6 +1745,7 @@ class RTL8188EU:
             except Exception:
                 continue
 
+            rx_reads += 1
             urb = bytes(data)
             for desc, payload in self.iter_rx_payloads(urb):
                 if desc.rpt_sel != 0 or not payload:
@@ -1784,6 +1778,12 @@ class RTL8188EU:
                         next_send = max(next_send, now + 2.0)
                 written += 1
 
+            if self.tx_debug and now >= next_status:
+                sys.stderr.write(
+                    f"deauth-burst: sent={sent} ok={tx_ok} err={tx_err} rx_reads={rx_reads} pcap_written={written}\n"
+                )
+                next_status = now + 1.0
+
         pcap.flush()
         return sent, written
 
@@ -1812,6 +1812,7 @@ def resolve_firmware_path(arg: Optional[Path]) -> Optional[Path]:
 
 def main(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(prog="rtl8188eu_pyusb")
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("--vid", type=lambda s: int(s, 0), default=0x2357)
     parser.add_argument("--pid", type=lambda s: int(s, 0), default=0x010C)
     parser.add_argument("--firmware", type=Path, default=None)
@@ -1848,6 +1849,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--burst-duration-s", type=int, default=0, help="Total run time for --deauth-burst (0 = until Ctrl-C)")
     parser.add_argument("--burst-read-timeout-ms", type=int, default=50, help="USB read timeout during --deauth-burst loop")
     parser.add_argument("--tx-debug", action="store_true")
+    parser.add_argument("--tx-timeout-ms", type=int, default=100)
     parser.add_argument("--tx-dump-bytes", type=int, default=0)
     args = parser.parse_args(argv)
 
@@ -1879,8 +1881,17 @@ def main(argv: Sequence[str]) -> int:
     try:
         chip.open()
         chip.init_device(firmware_path, channel=args.channel, bw=args.bw)
-        chip.tx_debug = bool(args.tx_debug)
+        chip.tx_debug = bool(args.tx_debug or args.debug)
         chip.tx_dump_bytes = int(args.tx_dump_bytes)
+        chip.tx_timeout_ms = int(args.tx_timeout_ms)
+
+        if args.debug:
+            intf_num = chip.intf.bInterfaceNumber if chip.intf is not None else -1
+            ep_in = chip.ep_in if chip.ep_in is not None else 0
+            sys.stderr.write(f"USB: intf={intf_num} ep_in=0x{ep_in:02x} bulk_out={len(chip.bulk_out_eps)}")
+            for i, ep in enumerate(chip.bulk_out_eps):
+                sys.stderr.write(f" ep_out[{i}]=0x{int(ep):02x}")
+            sys.stderr.write("\n")
         if args.init_only:
             return 0
         if args.deauth_burst:
