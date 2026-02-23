@@ -1961,6 +1961,12 @@ static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus
 
     libusb_set_auto_detach_kernel_driver(d->handle, 1);
 
+    int active_cfg = 0;
+    r = libusb_get_configuration(d->handle, &active_cfg);
+    if (r == 0 && active_cfg == 0) {
+        (void)libusb_set_configuration(d->handle, 1);
+    }
+
     libusb_device *dev = libusb_get_device(d->handle);
     struct libusb_config_descriptor *cfg = NULL;
     r = libusb_get_active_config_descriptor(dev, &cfg);
@@ -1974,6 +1980,7 @@ static void open_device(rtl8188eu_t *d, uint16_t vid, uint16_t pid, int want_bus
 
     r = libusb_claim_interface(d->handle, d->intf_num);
     if (r != 0) dief("claim_interface failed: %s", libusb_error_name(r));
+    (void)libusb_set_interface_alt_setting(d->handle, d->intf_num, 0);
 
     uint8_t bulk_in = 0;
     uint8_t bulk_out_eps[8];
