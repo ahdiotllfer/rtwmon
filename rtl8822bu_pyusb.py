@@ -33,8 +33,18 @@ QSLT_BK = 0x02
 QSLT_BE = 0x00
 QSLT_VI = 0x05
 QSLT_VO = 0x07
-RATEID_IDX_G = 7
-DESC_RATE6M = 0x04
+RATE_ID_B_MODE = 0x06
+
+TXDESC_OFFSET_SHT = 16
+TXDESC_QSEL_SHT = 8
+TXDESC_RATE_ID_SHT = 16
+TXDESC_SEQ_SHT = 16
+TXDESC_BMC = 1 << 24
+TXDESC_LSG = 1 << 26
+TXDESC_FSG = 1 << 27
+TXDESC_OWN = 1 << 31
+TXDESC_HW_SSN = 1 << 7
+TXDESC_USERATE = 1 << 8
 
 
 def _read_le32(buf: bytes, off: int) -> int:
@@ -56,10 +66,10 @@ def _txdesc_checksum_8822b(desc48: bytearray) -> int:
     if len(desc48) != TXDESC_SIZE:
         raise ValueError("txdesc must be 48 bytes")
     _set_bits_le32(desc48, 28, 0, 16, 0)
-    words = struct.unpack_from("<24H", desc48, 0)
+    words = struct.unpack_from("<16H", desc48, 0)
     checksum = 0
-    for w in words:
-        checksum ^= int(w)
+    for i in range(8):
+        checksum ^= int(words[2 * i]) ^ int(words[2 * i + 1])
     checksum &= 0xFFFF
     _set_bits_le32(desc48, 28, 0, 16, checksum)
     return checksum
@@ -69,31 +79,27 @@ def build_txdesc_8822b(
     payload_len: int,
     *,
     queue_sel: int = QSLT_MGNT,
-    rate: int = DESC_RATE6M,
-    rate_id: int = RATEID_IDX_G,
+    rate_id: int = RATE_ID_B_MODE,
     bmc: bool = False,
     seq_ctl: int = 0,
 ) -> bytes:
     if payload_len < 0 or payload_len > 0xFFFF:
         raise ValueError("payload_len out of range")
     d = bytearray(TXDESC_SIZE)
-    _set_bits_le32(d, 0, 0, 16, payload_len)
-    _set_bits_le32(d, 0, 16, 8, TXDESC_SIZE)
-    _set_bits_le32(d, 0, 24, 1, 1 if bmc else 0)
-    _set_bits_le32(d, 0, 26, 1, 1)
-    _set_bits_le32(d, 0, 27, 1, 1)
-    _set_bits_le32(d, 0, 31, 1, 1)
+    txdw0 = (int(payload_len) & 0xFFFF) | ((TXDESC_SIZE & 0xFF) << TXDESC_OFFSET_SHT)
+    txdw0 |= TXDESC_FSG | TXDESC_LSG | TXDESC_OWN
+    if bmc:
+        txdw0 |= TXDESC_BMC
+    _write_le32(d, 0, txdw0)
 
-    _set_bits_le32(d, 4, 0, 7, 0)
-    _set_bits_le32(d, 4, 8, 5, queue_sel & 0x1F)
-    _set_bits_le32(d, 4, 16, 5, rate_id & 0x1F)
+    txdw1 = ((int(queue_sel) & 0x1F) << TXDESC_QSEL_SHT) | ((int(rate_id) & 0x0F) << TXDESC_RATE_ID_SHT)
+    _write_le32(d, 4, txdw1)
 
-    _set_bits_le32(d, 12, 16, 16, (int(seq_ctl) & 0xFFFF))
-    _set_bits_le32(d, 12, 28, 4, 8)
+    txdw3 = ((int(seq_ctl) & 0xFFFF) << TXDESC_SEQ_SHT) | (8 << 28)
+    _write_le32(d, 12, txdw3)
 
-    _set_bits_le32(d, 16, 0, 7, int(rate) & 0x7F)
-    _set_bits_le32(d, 16, 7, 1, 1)
-    _set_bits_le32(d, 16, 8, 1, 1)
+    txdw4 = TXDESC_USERATE | TXDESC_HW_SSN
+    _write_le32(d, 16, txdw4)
 
     _txdesc_checksum_8822b(d)
     return bytes(d)
@@ -906,6 +912,7 @@ class Rtl8822buUsb:
     def tx_frame(self, frame: bytes, *, ep_addr: Optional[int] = None) -> int:
         if len(frame) < 2:
             raise ValueError("frame too short")
+        frame, _ = _strip_fcs_if_present(frame)
         a1 = frame[4:10] if len(frame) >= 10 else None
         bmc = _is_broadcast_or_multicast(a1)
 
@@ -913,7 +920,7 @@ class Rtl8822buUsb:
         if len(frame) >= 24:
             seq_ctl = int.from_bytes(frame[22:24], "little")
 
-        desc = build_txdesc_8822b(len(frame), queue_sel=QSLT_MGNT, rate=DESC_RATE6M, rate_id=RATEID_IDX_G, bmc=bmc, seq_ctl=seq_ctl)
+        desc = build_txdesc_8822b(len(frame), queue_sel=QSLT_MGNT, rate_id=RATE_ID_B_MODE, bmc=bmc, seq_ctl=seq_ctl)
         return self.bulk_write(desc + frame, ep_addr=ep_addr)
 
     def send_deauth(
