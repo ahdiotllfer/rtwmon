@@ -1881,11 +1881,31 @@ def resolve_firmware_path(arg: Optional[Path]) -> Optional[Path]:
 
 def main(argv: Sequence[str]) -> int:
     argv = list(argv)
-    if argv and argv[0] == "scan":
-        argv = ["--scan", *argv[1:]]
+    if argv:
+        cmd = argv[0]
+        if cmd == "scan":
+            argv = ["--scan", *argv[1:]]
+        elif cmd == "rx":
+            argv = ["--rx", *argv[1:]]
+        elif cmd == "deauth":
+            argv = ["--deauth", *argv[1:]]
+        elif cmd == "disassoc":
+            argv = ["--disassoc", *argv[1:]]
+        elif cmd == "deauth-burst":
+            argv = ["--deauth-burst", *argv[1:]]
+        elif cmd == "pcap":
+            if len(argv) >= 2 and argv[1] != "-" and not str(argv[1]).startswith("-"):
+                argv = ["--pcap", argv[1], *argv[2:]]
+            else:
+                argv = [*argv[1:]]
+
     for i, a in enumerate(list(argv)):
         if a == "--channels":
             argv[i] = "--scan-channels"
+        elif a == "--station-scan-ms":
+            argv[i] = "--station-scan-time"
+        elif a == "--size":
+            argv[i] = "--read-size"
     parser = argparse.ArgumentParser(prog="rtl8188eu_pyusb")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--vid", type=lambda s: int(s, 0), default=0x2357)
@@ -1922,7 +1942,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--delay-ms", type=int, default=100, help="Delay between frames in ms")
     parser.add_argument("--burst-size", type=int, default=10, help="Frames per burst for --deauth-burst")
     parser.add_argument("--burst-interval-ms", type=int, default=1000, help="Delay between bursts for --deauth-burst")
-    parser.add_argument("--burst-duration-s", type=int, default=0, help="Total run time for --deauth-burst (0 = until Ctrl-C)")
+    parser.add_argument("--burst-duration-s", type=float, default=0.0, help="Total run time for --deauth-burst (0 = until Ctrl-C)")
     parser.add_argument("--burst-read-timeout-ms", type=int, default=50, help="USB read timeout during --deauth-burst loop")
     parser.add_argument("--tx-debug", action="store_true")
     parser.add_argument("--tx-timeout-ms", type=int, default=100)

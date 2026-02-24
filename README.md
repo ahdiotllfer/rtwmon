@@ -1,6 +1,6 @@
 # rtwmon
 
-`rtl8188eu_pyusb.py` is a Python userspace tool that talks to an RTL8188EU USB Wi‑Fi device via PyUSB. It can:
+`rtwmon` is a set of userspace tools for Realtek USB Wi‑Fi adapters. It can:
 
 - Initialize the device and load firmware
 - Passively scan channels and optionally list stations for a target SSID
@@ -9,6 +9,14 @@
 - Send disassociation / deauthentication frames
 - Send deauth bursts while capturing to PCAP
 
+## Supported adapters
+
+| Chipset | USB ID (VID:PID) | Backend |
+|---|---|---|
+| RTL8188EU | `2357:010c` | `rtl8188eu_libusb` (preferred) or `rtl8188eu_pyusb.py` |
+| RTL8821AU | `2357:0120` | `rtl8821au_pyusb.py` |
+| RTL8822BU | `0bda:b812` | `rtl8822bu_pyusb.py` |
+
 ## Requirements
 
 - Python 3
@@ -16,6 +24,36 @@
 - Firmware file `rtl8188eufw.bin` (auto-searched in common locations, or pass `--firmware`)
 
 ## Usage
+
+### Unified entrypoint (recommended)
+
+Use `rtwmon.py` to autodetect the adapter by USB VID:PID and run the correct backend with a unified CLI:
+
+```bash
+python3 rtwmon.py scan --channels 1-11
+```
+
+Termux (no root): pass the USB device through `termux-usb`; the wrapper accepts a trailing numeric FD:
+
+```bash
+termux-usb -e "python3 rtwmon.py scan --channels 1-11" /dev/bus/usb/001/003
+```
+
+Select a backend explicitly:
+
+```bash
+python3 rtwmon.py --driver 8822bu scan --channels 1-13
+```
+
+### Device-specific tools
+
+- RTL8188EU: `rtl8188eu_libusb` (C/libusb) and `rtl8188eu_pyusb.py` (Python/PyUSB)
+- RTL8821AU: `rtl8821au_pyusb.py`
+- RTL8822BU: `rtl8822bu_pyusb.py`
+
+### RTL8188EU (PyUSB) legacy CLI
+
+`rtl8188eu_pyusb.py` is a Python userspace tool that talks to an RTL8188EU USB Wi‑Fi device via PyUSB:
 
 ```bash
 python3 rtl8188eu_pyusb.py [options]
@@ -32,7 +70,7 @@ If you run without a “mode” option (`--scan`, `--pcap`, `--rx`, `--disassoc`
 | `--vid` | `0x2357` | USB vendor id, accepts hex (`0x...`) or decimal |
 | `--pid` | `0x010C` | USB product id, accepts hex (`0x...`) or decimal |
 | `--firmware` | auto | Path to `rtl8188eufw.bin` (if not set, tries local `firmware/` and common system paths) |
-| `--tables-from` | `rtl8xxxu_8188e.c` | Path to a kernel driver source file used to extract tables |
+| `--tables-from` | `firmware/rtl8xxxu_8188e.c` | Path to a kernel driver source file used to extract tables |
 | `--channel` | `1` | Channel used for init / RX / TX modes |
 | `--bw` | `20` | Channel bandwidth (`20` or `40`) |
 | `--init-only` | off | Initialize device then exit |
