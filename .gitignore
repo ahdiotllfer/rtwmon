@@ -5,5 +5,8 @@ rtl8821au_libusb.c
 *.so
 *.so.*
 
+__pycache__/
+*.pyc
+
 rtl8188eu_libusb
 rtl8821au_libusb
