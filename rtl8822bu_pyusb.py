@@ -216,6 +216,98 @@ def _parse_addrs_any(frame: bytes) -> tuple[Optional[bytes], Optional[bytes], Op
     a1, a2, a3, a4, ftype2, subtype2, seq = _parse_addrs(frame)
     dur = int.from_bytes(frame[2:4], "little") if len(frame) >= 4 else 0
     return a1, a2, a3, a4, ftype2, subtype2, seq, dur
+
+
+def _detect_4way_eapol(frame: bytes) -> Optional[tuple[int, Optional[bytes], Optional[bytes], int, int]]:
+    if len(frame) < 32:
+        return None
+    fc = int.from_bytes(frame[0:2], "little")
+    ftype = (fc >> 2) & 0x3
+    if ftype != 2:
+        return None
+
+    subtype = (fc >> 4) & 0xF
+    to_ds = bool((fc >> 8) & 0x1)
+    from_ds = bool((fc >> 9) & 0x1)
+    order = bool((fc >> 15) & 0x1)
+
+    hdr_len = 24
+    if to_ds and from_ds:
+        hdr_len += 6
+    if subtype & 0x8:
+        hdr_len += 2
+    if order:
+        hdr_len += 4
+    if len(frame) < hdr_len + 8 + 4 + 1 + 2 + 8:
+        return None
+
+    llc = frame[hdr_len : hdr_len + 8]
+    if llc != b"\xaa\xaa\x03\x00\x00\x00\x88\x8e":
+        return None
+
+    eapol_off = hdr_len + 8
+    eapol_type = frame[eapol_off + 1]
+    if eapol_type != 3:
+        return None
+
+    eapol_len = int.from_bytes(frame[eapol_off + 2 : eapol_off + 4], "big")
+    if len(frame) < eapol_off + 4 + eapol_len:
+        return None
+    if eapol_len < 1 + 2 + 8:
+        return None
+
+    key_desc_type = frame[eapol_off + 4]
+    if key_desc_type not in (2,):
+        return None
+
+    key_info = int.from_bytes(frame[eapol_off + 5 : eapol_off + 7], "big")
+    replay = int.from_bytes(frame[eapol_off + 9 : eapol_off + 17], "big")
+
+    key_type = bool(key_info & 0x0008)
+    install = bool(key_info & 0x0010)
+    ack = bool(key_info & 0x0020)
+    mic = bool(key_info & 0x0040)
+    secure = bool(key_info & 0x0080)
+
+    if not key_type:
+        return None
+
+    msg: Optional[int] = None
+    if ack and not mic:
+        msg = 1
+    elif (not ack) and mic and (not secure):
+        msg = 2
+    elif ack and mic and install:
+        msg = 3
+    elif (not ack) and mic and secure:
+        msg = 4
+
+    if msg is None:
+        return None
+
+    a1, a2, a3, _a4, _ftype2, _subtype2, _seq = _parse_addrs(frame)
+
+    bssid: Optional[bytes] = None
+    sta: Optional[bytes] = None
+    if not from_ds and to_ds:
+        bssid = a1
+        sta = a2
+    elif from_ds and not to_ds:
+        bssid = a2
+        sta = a1
+
+    return msg, bssid, sta, replay, key_info
+
+
+def _print_4way_if_present(frame: bytes) -> None:
+    info = _detect_4way_eapol(frame)
+    if info is None:
+        return
+    msg, bssid, sta, replay, key_info = info
+    bssid_s = _fmt_mac(bssid) if bssid is not None else "??"
+    sta_s = _fmt_mac(sta) if sta is not None else "??"
+    sys.stderr.write(f"4wh msg{msg} bssid={bssid_s} sta={sta_s} replay={replay} key_info=0x{key_info:04x}\n")
+    sys.stderr.flush()
  
  
 def _rnd8(n: int) -> int:
@@ -1390,11 +1482,10 @@ def main(argv: list[str]) -> int:
     p_deauth_burst.add_argument("--replay-report-mismatch", type=int, default=0)
     p_deauth_burst.add_argument("--replay-report-errors", type=int, default=0)
     p_deauth_burst.add_argument("--debug", action="store_true")
-    p_deauth_burst.add_argument("--burst-size", type=int, default=50)
+    p_deauth_burst.add_argument("--burst-size", type=int, default=20)
     p_deauth_burst.add_argument("--burst-interval-ms", type=int, default=0)
     p_deauth_burst.add_argument("--burst-duration-s", type=float, default=0.0)
     p_deauth_burst.add_argument("--burst-read-timeout-ms", type=int, default=50)
-    p_deauth_burst.add_argument("--status-interval-ms", type=int, default=1000)
     p_deauth_burst.add_argument("--read-size", type=int, default=32768, dest="read_size")
     p_deauth_burst.add_argument("--size", type=int, default=32768, dest="read_size")
 
@@ -1951,11 +2042,6 @@ def main(argv: list[str]) -> int:
                 duration_s = float(getattr(args, "burst_duration_s", 0.0))
                 t_end: Optional[float] = None if duration_s <= 0.0 else (time.monotonic() + max(0.0, duration_s))
                 next_send = time.monotonic()
-                status_interval_ms = max(0, int(getattr(args, "status_interval_ms", 1000)))
-                next_status = time.monotonic() + (status_interval_ms / 1000.0 if status_interval_ms > 0 else 1e9)
-                last_status_t = time.monotonic()
-                last_status_sent = 0
-                last_status_cap = 0
 
                 while True:
                     if t_end is not None and time.monotonic() >= t_end:
@@ -1979,23 +2065,6 @@ def main(argv: list[str]) -> int:
 
                     raw = dev.bulk_read_ep(int(ep_in), size=int(args.read_size), timeout_ms=int(args.burst_read_timeout_ms))
                     if not raw:
-                        now2 = time.monotonic()
-                        if now2 >= next_status:
-                            dt = max(1e-6, now2 - last_status_t)
-                            ds = int(sent) - int(last_status_sent)
-                            dc = int(captured) - int(last_status_cap)
-                            sys.stderr.write(
-                                f"[burst] sent={sent} captured={captured} sps={ds/dt:.1f} cps={dc/dt:.1f}\n"
-                            )
-                            sys.stderr.flush()
-                            try:
-                                pcap.flush()
-                            except Exception:
-                                pass
-                            last_status_t = now2
-                            last_status_sent = int(sent)
-                            last_status_cap = int(captured)
-                            next_status = now2 + (status_interval_ms / 1000.0 if status_interval_ms > 0 else 1e9)
                         continue
                     for pkt in parse_rx_agg(raw):
                         frame = pkt.frame
@@ -2019,26 +2088,12 @@ def main(argv: list[str]) -> int:
                                 flags_val |= 0x40
                             flags = flags_val
 
+                        _print_4way_if_present(frame if bool(args.pcap_with_fcs) else out_frame)
+
                         tsft = int(time.time() * 1_000_000)
                         rtap = _radiotap_header(tsft=tsft, channel=int(dev.current_channel), flags=flags)
                         pcap.write_packet(rtap + out_frame)
                         captured += 1
-
-                    now2 = time.monotonic()
-                    if now2 >= next_status:
-                        dt = max(1e-6, now2 - last_status_t)
-                        ds = int(sent) - int(last_status_sent)
-                        dc = int(captured) - int(last_status_cap)
-                        sys.stderr.write(f"[burst] sent={sent} captured={captured} sps={ds/dt:.1f} cps={dc/dt:.1f}\n")
-                        sys.stderr.flush()
-                        try:
-                            pcap.flush()
-                        except Exception:
-                            pass
-                        last_status_t = now2
-                        last_status_sent = int(sent)
-                        last_status_cap = int(captured)
-                        next_status = now2 + (status_interval_ms / 1000.0 if status_interval_ms > 0 else 1e9)
             except KeyboardInterrupt:
                 pass
             finally:
