@@ -111,7 +111,9 @@ def _pick_driver(vid: int, pid: int) -> Optional[str]:
     return None
 
 
-def _autodetect_driver(*, vid: Optional[int], pid: Optional[int], usb_fd: Optional[int]) -> Tuple[str, Optional[Tuple[int, int]]]:
+def _autodetect_driver(
+    *, vid: Optional[int], pid: Optional[int], usb_fd: Optional[int], bus: Optional[int], address: Optional[int]
+) -> Tuple[str, Optional[Tuple[int, int]]]:
     if usb_fd is not None and int(usb_fd) >= 0:
         v, p = _detect_vid_pid_from_usb_fd(int(usb_fd))
         drv = _pick_driver(v, p)
@@ -135,14 +137,42 @@ def _autodetect_driver(*, vid: Optional[int], pid: Optional[int], usb_fd: Option
         want = set()
         for info in SUPPORTED.values():
             want |= set(info["ids"])
+        matches = []
         found = list(usb.find(find_all=True) or [])
         for d in found:
             dv = int(getattr(d, "idVendor", 0) or 0)
             dp = int(getattr(d, "idProduct", 0) or 0)
-            if (dv, dp) in want:
-                drv = _pick_driver(dv, dp)
-                if drv is not None:
-                    return drv, (dv, dp)
+            if (dv, dp) not in want:
+                continue
+            if bus is not None and int(bus) >= 0 and int(getattr(d, "bus", -1) or -1) != int(bus):
+                continue
+            if address is not None and int(address) >= 0 and int(getattr(d, "address", -1) or -1) != int(address):
+                continue
+            drv = _pick_driver(dv, dp)
+            if drv is None:
+                continue
+            matches.append((drv, dv, dp, int(getattr(d, "bus", -1) or -1), int(getattr(d, "address", -1) or -1)))
+
+        uniq = {(drv, dv, dp, b, a) for (drv, dv, dp, b, a) in matches}
+        if len(uniq) == 1:
+            drv, dv, dp, _b, _a = next(iter(uniq))
+            return drv, (dv, dp)
+        if len(uniq) > 1:
+            rows = sorted(uniq, key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+            parts = []
+            for drv, dv, dp, b, a in rows:
+                extra = []
+                if b >= 0:
+                    extra.append(f"bus={b}")
+                if a >= 0:
+                    extra.append(f"address={a}")
+                extra_s = f" ({', '.join(extra)})" if extra else ""
+                parts.append(f"{drv}:{dv:04x}:{dp:04x}{extra_s}")
+            raise RuntimeError(
+                "Multiple supported adapters detected: "
+                + ", ".join(parts)
+                + ". Use --driver or --vid/--pid/--bus/--address to choose."
+            )
 
     try:
         out = subprocess.check_output(["lsusb"], stderr=subprocess.DEVNULL, text=True)
@@ -184,6 +214,7 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--address", type=int, default=-1)
     ap.add_argument("--interface", type=int, default=0)
     ap.add_argument("--configuration", type=int, default=1)
+    ap.add_argument("--tables-from", type=str, default="")
     ap.add_argument("--debug", action="store_true")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -257,10 +288,14 @@ def main(argv: Sequence[str]) -> int:
         driver = str(args.driver)
         detected = None
     else:
+        bus = int(getattr(args, "bus", -1))
+        addr = int(getattr(args, "address", -1))
         driver, detected = _autodetect_driver(
             vid=(int(want_vid) if want_vid is not None else None),
             pid=(int(want_pid) if want_pid is not None else None),
             usb_fd=(usb_fd if usb_fd >= 0 else None),
+            bus=(bus if bus >= 0 else None),
+            address=(addr if addr >= 0 else None),
         )
 
     if args.cmd == "info":
@@ -294,6 +329,11 @@ def main(argv: Sequence[str]) -> int:
         fwd += ["--pid", hex(int(want_pid))]
     if usb_fd >= 0:
         fwd += ["--usb-fd", str(int(usb_fd))]
+    if driver == "8188eu" and not use_8188eu_bin:
+        tables_from = str(getattr(args, "tables_from", "") or "").strip()
+        if not tables_from:
+            tables_from = str((Path(__file__).resolve().parent / "firmware" / "rtl8xxxu_8188e.c").resolve())
+        fwd += ["--tables-from", tables_from]
 
     if driver in ("8821au", "8822bu"):
         bus = int(getattr(args, "bus", -1))
@@ -333,6 +373,7 @@ def main(argv: Sequence[str]) -> int:
                 str(int(getattr(args, "station_scan_ms", 5000))),
             ]
         else:
+            size_flag = "--size" if driver == "8821au" else "--read-size"
             cmd_argv += [
                 "scan",
                 "--channels",
@@ -343,7 +384,7 @@ def main(argv: Sequence[str]) -> int:
                 str(int(getattr(args, "dwell_ms", 1000))),
                 "--timeout-ms",
                 str(int(getattr(args, "timeout_ms", 1200))),
-                "--read-size",
+                size_flag,
                 str(int(getattr(args, "read_size", 32768))),
                 "--target-ssid",
                 str(getattr(args, "target_ssid", "")),
