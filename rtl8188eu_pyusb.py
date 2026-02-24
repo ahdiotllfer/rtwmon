@@ -9,6 +9,67 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 
+def _libusb_error_name(lib, code: int) -> str:
+    try:
+        f = getattr(lib, "libusb_error_name", None)
+        if f is None:
+            return str(int(code))
+        import ctypes
+
+        f.argtypes = [ctypes.c_int]
+        f.restype = ctypes.c_char_p
+        s = f(int(code))
+        if isinstance(s, (bytes, bytearray)):
+            return s.decode("utf-8", errors="replace")
+        if s is None:
+            return str(int(code))
+        return str(s)
+    except Exception:
+        return str(int(code))
+
+
+def _open_device_from_usb_fd(usb_fd: int):
+    import ctypes
+    import usb.backend.libusb1 as libusb1
+    import usb.core
+
+    backend = libusb1.get_backend()
+    lib = backend.lib
+
+    wrap = getattr(lib, "libusb_wrap_sys_device", None)
+    if wrap is None:
+        raise RuntimeError("libusb_wrap_sys_device not available (need libusb >= 1.0.23)")
+    wrap.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    wrap.restype = ctypes.c_int
+
+    handle = ctypes.c_void_p()
+    r = int(wrap(backend.ctx, ctypes.c_void_p(int(usb_fd)), ctypes.byref(handle)))
+    if r != 0:
+        raise RuntimeError(f"libusb_wrap_sys_device failed: {_libusb_error_name(lib, r)}")
+    if not handle:
+        raise RuntimeError("libusb_wrap_sys_device returned NULL handle")
+
+    get_dev = getattr(lib, "libusb_get_device", None)
+    if get_dev is None:
+        raise RuntimeError("libusb_get_device not available")
+    get_dev.argtypes = [ctypes.c_void_p]
+    get_dev.restype = ctypes.c_void_p
+    dev_ptr = ctypes.c_void_p(get_dev(handle))
+    if not dev_ptr:
+        raise RuntimeError("libusb_get_device returned NULL device")
+
+    dev_id = libusb1._Device(dev_ptr)
+    dev = usb.core.Device(dev_id, backend)
+
+    class _WrappedHandle:
+        def __init__(self, *, handle, devid):
+            self.handle = handle
+            self.devid = devid
+
+    dev._ctx.handle = _WrappedHandle(handle=handle, devid=dev_id.devid)
+    return dev
+
+
 REALTEK_USB_READ = 0xC0
 REALTEK_USB_WRITE = 0x40
 REALTEK_USB_CMD_REQ = 0x05
@@ -1788,9 +1849,17 @@ class RTL8188EU:
         return sent, written
 
 
-def find_device(vid: int, pid: int):
+def find_device(vid: int, pid: int, *, usb_fd: Optional[int] = None):
     import usb.core
 
+    if usb_fd is not None and int(usb_fd) >= 0:
+        dev = _open_device_from_usb_fd(int(usb_fd))
+        if int(getattr(dev, "idVendor", 0)) != int(vid) or int(getattr(dev, "idProduct", 0)) != int(pid):
+            raise RuntimeError(
+                f"USB FD device mismatch: got {int(getattr(dev, 'idVendor', 0)):04x}:{int(getattr(dev, 'idProduct', 0)):04x} "
+                f"want {int(vid):04x}:{int(pid):04x}"
+            )
+        return dev
     return usb.core.find(idVendor=vid, idProduct=pid)
 
 
@@ -1815,6 +1884,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--vid", type=lambda s: int(s, 0), default=0x2357)
     parser.add_argument("--pid", type=lambda s: int(s, 0), default=0x010C)
+    parser.add_argument("--usb-fd", type=int, default=-1)
     parser.add_argument("--firmware", type=Path, default=None)
     parser.add_argument("--tables-from", type=Path, default=Path(__file__).resolve().parent / "rtl8xxxu_8188e.c")
     parser.add_argument("--channel", type=int, default=1)
@@ -1851,7 +1921,19 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--tx-debug", action="store_true")
     parser.add_argument("--tx-timeout-ms", type=int, default=100)
     parser.add_argument("--tx-dump-bytes", type=int, default=0)
-    args = parser.parse_args(argv)
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        if (
+            len(extra) == 1
+            and extra[0] == argv[-1]
+            and re.fullmatch(r"[0-9]+", extra[0]) is not None
+            and int(getattr(args, "usb_fd", -1)) < 0
+        ):
+            usb_fd_auto = int(extra[0], 10)
+            args = parser.parse_args(argv[:-1])
+            args.usb_fd = usb_fd_auto
+        else:
+            parser.error("unrecognized arguments: " + " ".join(extra))
 
     try:
         import usb.core
@@ -1860,7 +1942,8 @@ def main(argv: Sequence[str]) -> int:
         sys.stderr.write(f"pyusb not available: {e}\n")
         return 2
 
-    dev = find_device(args.vid, args.pid)
+    usb_fd = int(getattr(args, "usb_fd", -1))
+    dev = find_device(args.vid, args.pid, usb_fd=(usb_fd if usb_fd >= 0 else None))
     if dev is None:
         sys.stderr.write(f"USB device not found: vid=0x{args.vid:04x} pid=0x{args.pid:04x}\n")
         return 1
