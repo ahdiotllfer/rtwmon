@@ -1394,6 +1394,7 @@ def main(argv: list[str]) -> int:
     p_deauth_burst.add_argument("--burst-interval-ms", type=int, default=0)
     p_deauth_burst.add_argument("--burst-duration-s", type=float, default=0.0)
     p_deauth_burst.add_argument("--burst-read-timeout-ms", type=int, default=50)
+    p_deauth_burst.add_argument("--status-interval-ms", type=int, default=1000)
     p_deauth_burst.add_argument("--read-size", type=int, default=32768, dest="read_size")
     p_deauth_burst.add_argument("--size", type=int, default=32768, dest="read_size")
 
@@ -1948,12 +1949,17 @@ def main(argv: list[str]) -> int:
             try:
                 interval_ms = int(getattr(args, "burst_interval_ms", 0))
                 duration_s = float(getattr(args, "burst_duration_s", 0.0))
-                if duration_s <= 0.0:
-                    duration_s = 1.0
-                t_end = time.monotonic() + max(0.0, duration_s)
+                t_end: Optional[float] = None if duration_s <= 0.0 else (time.monotonic() + max(0.0, duration_s))
                 next_send = time.monotonic()
+                status_interval_ms = max(0, int(getattr(args, "status_interval_ms", 1000)))
+                next_status = time.monotonic() + (status_interval_ms / 1000.0 if status_interval_ms > 0 else 1e9)
+                last_status_t = time.monotonic()
+                last_status_sent = 0
+                last_status_cap = 0
 
-                while time.monotonic() < t_end:
+                while True:
+                    if t_end is not None and time.monotonic() >= t_end:
+                        break
                     now = time.monotonic()
                     if now >= next_send:
                         burst_size = max(0, int(getattr(args, "burst_size", 50)))
@@ -1969,10 +1975,27 @@ def main(argv: list[str]) -> int:
                         if interval_ms > 0:
                             next_send = now + (interval_ms / 1000.0)
                         else:
-                            next_send = t_end + 999.0
+                            next_send = float("inf")
 
                     raw = dev.bulk_read_ep(int(ep_in), size=int(args.read_size), timeout_ms=int(args.burst_read_timeout_ms))
                     if not raw:
+                        now2 = time.monotonic()
+                        if now2 >= next_status:
+                            dt = max(1e-6, now2 - last_status_t)
+                            ds = int(sent) - int(last_status_sent)
+                            dc = int(captured) - int(last_status_cap)
+                            sys.stderr.write(
+                                f"[burst] sent={sent} captured={captured} sps={ds/dt:.1f} cps={dc/dt:.1f}\n"
+                            )
+                            sys.stderr.flush()
+                            try:
+                                pcap.flush()
+                            except Exception:
+                                pass
+                            last_status_t = now2
+                            last_status_sent = int(sent)
+                            last_status_cap = int(captured)
+                            next_status = now2 + (status_interval_ms / 1000.0 if status_interval_ms > 0 else 1e9)
                         continue
                     for pkt in parse_rx_agg(raw):
                         frame = pkt.frame
@@ -2000,6 +2023,24 @@ def main(argv: list[str]) -> int:
                         rtap = _radiotap_header(tsft=tsft, channel=int(dev.current_channel), flags=flags)
                         pcap.write_packet(rtap + out_frame)
                         captured += 1
+
+                    now2 = time.monotonic()
+                    if now2 >= next_status:
+                        dt = max(1e-6, now2 - last_status_t)
+                        ds = int(sent) - int(last_status_sent)
+                        dc = int(captured) - int(last_status_cap)
+                        sys.stderr.write(f"[burst] sent={sent} captured={captured} sps={ds/dt:.1f} cps={dc/dt:.1f}\n")
+                        sys.stderr.flush()
+                        try:
+                            pcap.flush()
+                        except Exception:
+                            pass
+                        last_status_t = now2
+                        last_status_sent = int(sent)
+                        last_status_cap = int(captured)
+                        next_status = now2 + (status_interval_ms / 1000.0 if status_interval_ms > 0 else 1e9)
+            except KeyboardInterrupt:
+                pass
             finally:
                 pcap.flush()
                 if fp is not sys.stdout.buffer:
