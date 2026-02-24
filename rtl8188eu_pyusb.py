@@ -1880,6 +1880,12 @@ def resolve_firmware_path(arg: Optional[Path]) -> Optional[Path]:
 
 
 def main(argv: Sequence[str]) -> int:
+    argv = list(argv)
+    if argv and argv[0] == "scan":
+        argv = ["--scan", *argv[1:]]
+    for i, a in enumerate(list(argv)):
+        if a == "--channels":
+            argv[i] = "--scan-channels"
     parser = argparse.ArgumentParser(prog="rtl8188eu_pyusb")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--vid", type=lambda s: int(s, 0), default=0x2357)
