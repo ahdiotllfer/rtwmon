@@ -13,7 +13,7 @@
 
 | Chipset | USB ID (VID:PID) | Backend |
 |---|---|---|
-| RTL8188EU | `2357:010c` | `rtl8188eu_libusb` (preferred) or `rtl8188eu_pyusb.py` |
+| RTL8188EU | `2357:010c` | `rtl8188eu_libusb` or `rtl8188eu_pyusb.py` |
 | RTL8821AU | `2357:0120` | `rtl8821au_pyusb.py` |
 | RTL8822BU | `0bda:b812` | `rtl8822bu_pyusb.py` |
 
