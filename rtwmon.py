@@ -178,12 +178,35 @@ def _autodetect_driver(
         out = subprocess.check_output(["lsusb"], stderr=subprocess.DEVNULL, text=True)
     except Exception:
         out = ""
-    m = re.findall(r"ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})", out)
-    for vs, ps in m:
-        dv, dp = int(vs, 16), int(ps, 16)
+    matches2 = []
+    for bs, ds, vs, ps in re.findall(r"Bus\s+([0-9]+)\s+Device\s+([0-9]+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})", out):
+        b = int(bs, 10)
+        a = int(ds, 10)
+        dv = int(vs, 16)
+        dp = int(ps, 16)
         drv = _pick_driver(dv, dp)
-        if drv is not None:
-            return drv, (dv, dp)
+        if drv is None:
+            continue
+        if bus is not None and int(bus) >= 0 and b != int(bus):
+            continue
+        if address is not None and int(address) >= 0 and a != int(address):
+            continue
+        matches2.append((drv, dv, dp, b, a))
+
+    uniq2 = {(drv, dv, dp, b, a) for (drv, dv, dp, b, a) in matches2}
+    if len(uniq2) == 1:
+        drv, dv, dp, _b, _a = next(iter(uniq2))
+        return drv, (dv, dp)
+    if len(uniq2) > 1:
+        rows = sorted(uniq2, key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+        parts = []
+        for drv, dv, dp, b, a in rows:
+            parts.append(f"{drv}:{dv:04x}:{dp:04x} (bus={b}, address={a})")
+        raise RuntimeError(
+            "Multiple supported adapters detected: "
+            + ", ".join(parts)
+            + ". Use --driver or --vid/--pid/--bus/--address to choose."
+        )
 
     raise RuntimeError("No supported Realtek USB adapter found (use --driver or --vid/--pid/--usb-fd)")
 
@@ -329,7 +352,7 @@ def main(argv: Sequence[str]) -> int:
         fwd += ["--pid", hex(int(want_pid))]
     if usb_fd >= 0:
         fwd += ["--usb-fd", str(int(usb_fd))]
-    if driver == "8188eu" and not use_8188eu_bin:
+    if driver == "8188eu":
         tables_from = str(getattr(args, "tables_from", "") or "").strip()
         if not tables_from:
             tables_from = str((Path(__file__).resolve().parent / "firmware" / "rtl8xxxu_8188e.c").resolve())
