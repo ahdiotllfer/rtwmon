@@ -1490,7 +1490,7 @@ def main(argv: list[str]) -> int:
     p_deauth_burst.add_argument("--replay-report-errors", type=int, default=0)
     p_deauth_burst.add_argument("--debug", action="store_true")
     p_deauth_burst.add_argument("--burst-size", type=int, default=20)
-    p_deauth_burst.add_argument("--burst-interval-ms", type=int, default=0)
+    p_deauth_burst.add_argument("--burst-interval-ms", type=int, default=2000)
     p_deauth_burst.add_argument("--burst-duration-s", type=float, default=0.0)
     p_deauth_burst.add_argument("--burst-read-timeout-ms", type=int, default=50)
     p_deauth_burst.add_argument("--read-size", type=int, default=32768, dest="read_size")
@@ -2045,7 +2045,7 @@ def main(argv: list[str]) -> int:
             sent = 0
             captured = 0
             try:
-                interval_ms = int(getattr(args, "burst_interval_ms", 0))
+                interval_ms = int(getattr(args, "burst_interval_ms", 2000))
                 duration_s = float(getattr(args, "burst_duration_s", 0.0))
                 t_end: Optional[float] = None if duration_s <= 0.0 else (time.monotonic() + max(0.0, duration_s))
                 next_send = time.monotonic()
@@ -2055,7 +2055,7 @@ def main(argv: list[str]) -> int:
                         break
                     now = time.monotonic()
                     if now >= next_send:
-                        burst_size = max(0, int(getattr(args, "burst_size", 50)))
+                        burst_size = max(0, int(getattr(args, "burst_size", 20)))
                         for _ in range(burst_size):
                             dev.send_deauth(
                                 dest=str(args.target_mac),
@@ -2066,7 +2066,9 @@ def main(argv: list[str]) -> int:
                             )
                             sent += 1
                         if interval_ms > 0:
-                            next_send = now + (interval_ms / 1000.0)
+                            next_send += interval_ms / 1000.0
+                            if next_send < now:
+                                next_send = now + (interval_ms / 1000.0)
                         else:
                             next_send = float("inf")
 
