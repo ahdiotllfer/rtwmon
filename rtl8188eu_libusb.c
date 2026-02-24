@@ -2135,7 +2135,7 @@ static char *resolve_firmware_path(const char *arg) {
 
 static char *default_tables_from(void) {
     char *dir = exe_dir();
-    char *p = path_join(dir, "rtl8xxxu_8188e.c");
+    char *p = path_join(dir, "firmware/rtl8xxxu_8188e.c");
     free(dir);
     return p;
 }
@@ -2151,7 +2151,7 @@ static void usage(const char *prog) {
         "  --address <int>             optional USB device address\n"
         "  --usb-fd <int>              termux-usb file descriptor (no root)\n"
         "  --firmware <path>           default auto\n"
-        "  --tables-from <path>        default ./rtl8xxxu_8188e.c (next to executable)\n"
+        "  --tables-from <path>        default ./firmware/rtl8xxxu_8188e.c (next to executable)\n"
         "  --channel <int>             default 1\n"
         "  --bw <20|40>                default 20\n"
         "  --init-only                 init then exit\n"

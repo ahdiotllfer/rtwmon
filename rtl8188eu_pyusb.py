@@ -1892,7 +1892,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--pid", type=lambda s: int(s, 0), default=0x010C)
     parser.add_argument("--usb-fd", type=int, default=-1)
     parser.add_argument("--firmware", type=Path, default=None)
-    parser.add_argument("--tables-from", type=Path, default=Path(__file__).resolve().parent / "rtl8xxxu_8188e.c")
+    parser.add_argument("--tables-from", type=Path, default=Path(__file__).resolve().parent / "firmware" / "rtl8xxxu_8188e.c")
     parser.add_argument("--channel", type=int, default=1)
     parser.add_argument("--bw", type=int, choices=(20, 40), default=20)
     parser.add_argument("--init-only", action="store_true")
