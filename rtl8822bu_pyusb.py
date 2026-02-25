@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import zlib
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
@@ -420,24 +421,29 @@ class PcapWriter:
         self.fp.flush()
 
 
-def _extract_mgmt_ssid_and_channel(payload: bytes) -> tuple[Optional[str], Optional[int]]:
-    def _inner(p: bytes) -> tuple[Optional[str], Optional[int]]:
+def _extract_ap_info(payload: bytes) -> Optional[dict]:
+    def _inner(p: bytes) -> Optional[dict]:
         if len(p) < 24:
-            return None, None
+            return None
         fc = int.from_bytes(p[0:2], "little")
         ftype = (fc >> 2) & 0x3
         subtype = (fc >> 4) & 0xF
         if ftype != 0 or subtype not in (5, 8):
-            return None, None
+            return None
 
         fixed_len = 12
         ies_off = 24 + fixed_len
         if len(p) < ies_off:
-            return None, None
-        ies = p[ies_off:]
+            return None
 
-        ssid: Optional[str] = None
-        channel: Optional[int] = None
+        info = {'ssid': None, 'channel': None, 'privacy': False, 'wpa': 0, 'wpa2': 0}
+        
+        if len(p) >= 36:
+            cap_info = int.from_bytes(p[34:36], "little")
+            if cap_info & 0x0010:
+                info['privacy'] = True
+
+        ies = p[ies_off:]
         off = 0
         while off + 2 <= len(ies):
             eid = ies[off]
@@ -446,25 +452,31 @@ def _extract_mgmt_ssid_and_channel(payload: bytes) -> tuple[Optional[str], Optio
             if off + elen > len(ies):
                 break
             data = ies[off : off + elen]
-            off += elen
-
+            
             if eid == 0:
                 if elen == 0:
-                    ssid = ""
+                    info['ssid'] = ""
                 else:
-                    ssid = data.decode("utf-8", errors="replace")
-            elif eid == 3 and elen == 1:
+                    info['ssid'] = data.decode("utf-8", errors="replace")
+            elif eid == 3 and elen >= 1:
                 ch = data[0]
                 if 1 <= ch <= 196:
-                    channel = int(ch)
-        return ssid, channel
+                    info['channel'] = int(ch)
+            elif eid == 48:
+                info['wpa2'] = 1
+            elif eid == 221:
+                if len(data) >= 4 and data.startswith(b'\x00\x50\xf2\x01'):
+                    info['wpa'] = 1
 
-    ssid, ch = _inner(payload)
-    if ssid is not None:
-        return ssid, ch
+            off += elen
+        return info
+
+    res = _inner(payload)
+    if res is not None and res['ssid'] is not None:
+        return res
     if len(payload) >= 28:
         return _inner(payload[:-4])
-    return None, None
+    return None
  
  
 def _libusb_error_name(lib, code: int) -> str:
@@ -1312,6 +1324,13 @@ def _resolve_replay_pcap(p: Optional[str]) -> Optional[str]:
             return str(p0)
     except Exception:
         pass
+    try:
+        if not p0.is_absolute():
+            p2 = (Path(__file__).resolve().parent / p0).resolve()
+            if p2.is_file():
+                return str(p2)
+    except Exception:
+        pass
     if ("/" not in ps) and ("\\" not in ps):
         p1 = Path(__file__).resolve().parent / "firmware" / ps
         try:
@@ -1720,8 +1739,25 @@ def main(argv: list[str]) -> int:
 
             target_ssid = str(getattr(args, "target_ssid", "")).strip()
 
+            def _best_channel(counts: object) -> int:
+                if not isinstance(counts, dict) or not counts:
+                    return 0
+                best_k = 0
+                best_v = -1
+                for k, v in counts.items():
+                    try:
+                        kk = int(k)
+                        vv = int(v)
+                    except Exception:
+                        continue
+                    if vv > best_v:
+                        best_v = vv
+                        best_k = kk
+                return best_k
+
             results: Dict[str, Dict[str, object]] = {}
             per_ch: Dict[int, Dict[str, int]] = {}
+            stations_by_bssid: Dict[str, Dict[str, int]] = {}
 
             pcap = None
             fp = None
@@ -1731,7 +1767,11 @@ def main(argv: list[str]) -> int:
                     fp = sys.stdout.buffer if p == "-" else open(p, "wb")
                     pcap = PcapWriter(fp)
 
-                for ch in channels:
+                scan_iter = channels
+                if not target_ssid:
+                    scan_iter = itertools.cycle(channels)
+
+                for ch in scan_iter:
                     dev.set_channel(int(ch), bandwidth_mhz=int(args.bw))
                     if int(getattr(args, "igi", -1)) >= 0:
                         dev.set_igi(int(args.igi))
@@ -1769,6 +1809,44 @@ def main(argv: list[str]) -> int:
                                 st["ctrl"] = int(st["ctrl"]) + 1
                             elif ftype == 2:
                                 st["data"] = int(st["data"]) + 1
+
+                            try:
+                                a1, a2, a3, _a4, _ft, _st, _seq, _dur = _parse_addrs_any(frame)
+                                sta_mac: Optional[str] = None
+                                frame_bssid: Optional[str] = None
+                                if ftype == 2:
+                                    to_ds = bool((fc >> 8) & 0x1)
+                                    from_ds = bool((fc >> 9) & 0x1)
+                                    if to_ds and not from_ds:
+                                        if a1 is not None and a2 is not None and _is_unicast_mac(a1) and _is_unicast_mac(a2) and a1 != a2:
+                                            frame_bssid = _fmt_mac(a1)
+                                            sta_mac = _fmt_mac(a2)
+                                    elif from_ds and not to_ds:
+                                        if a1 is not None and a2 is not None and _is_unicast_mac(a2) and _is_unicast_mac(a1) and a1 != a2:
+                                            frame_bssid = _fmt_mac(a2)
+                                            sta_mac = _fmt_mac(a1)
+                                elif ftype == 0 and a3 is not None and _is_unicast_mac(a3):
+                                    frame_bssid = _fmt_mac(a3)
+                                    a1_s = _fmt_mac(a1) if a1 is not None and _is_unicast_mac(a1) else None
+                                    a2_s = _fmt_mac(a2) if a2 is not None and _is_unicast_mac(a2) else None
+                                    if a2_s is not None and a2_s != frame_bssid:
+                                        sta_mac = a2_s
+                                    elif a1_s is not None and a1_s != frame_bssid:
+                                        sta_mac = a1_s
+
+                                if frame_bssid and sta_mac and frame_bssid != sta_mac:
+                                    stmap = stations_by_bssid.get(frame_bssid)
+                                    if stmap is None:
+                                        stmap = {}
+                                        stations_by_bssid[frame_bssid] = stmap
+                                    prev_seen = int(stmap.get(sta_mac, 0))
+                                    stmap[sta_mac] = prev_seen + 1
+                                    if prev_seen == 0:
+                                        sys.stdout.write(f"ch={tuned_ch:02d} sta={sta_mac} bssid={frame_bssid} seen=1\n")
+                                        sys.stdout.flush()
+                            except Exception:
+                                pass
+
                             if ftype != 0 or subtype not in (5, 8):
                                 continue
                             if subtype == 8:
@@ -1779,7 +1857,12 @@ def main(argv: list[str]) -> int:
                                 continue
 
                             bssid = frame[16:22]
-                            ssid, ch_ie = _extract_mgmt_ssid_and_channel(frame)
+                            info = _extract_ap_info(frame)
+                            if info is None:
+                                continue
+                            ssid = info['ssid']
+                            ch_ie = info['channel']
+                            
                             if bool(args.scan_strict_ds_channel) and ch_ie is not None and int(ch_ie) != tuned_ch:
                                 continue
                             bssid_s = _fmt_mac(bssid)
@@ -1793,6 +1876,9 @@ def main(argv: list[str]) -> int:
                                     "tuned_channel": 0,
                                     "ds_counts": {},
                                     "tuned_counts": {},
+                                    "privacy": info['privacy'],
+                                    "wpa": info['wpa'],
+                                    "wpa2": info['wpa2'],
                                 }
                                 results[bssid_s] = rec
                             rec["seen"] = int(rec.get("seen", 0)) + 1
@@ -1833,6 +1919,28 @@ def main(argv: list[str]) -> int:
                                 rtap = _radiotap_header(tsft=tsft, channel=int(dev.current_channel), flags=flags)
                                 if bool(args.pcap_include_bad_fcs) or not (pkt.crc_err or pkt.icv_err):
                                     pcap.write_packet(rtap + out_frame)
+                    
+                    if not target_ssid:
+                        rows_rt = list(results.values())
+                        rows_rt.sort(key=lambda r: (_best_channel(r.get("ds_counts")), _best_channel(r.get("tuned_counts")), str(r.get("ssid", ""))))
+                        for r in rows_rt:
+                            ssid = str(r.get("ssid", ""))
+                            if ssid == "":
+                                ssid = "<hidden>"
+                            ds_ch = _best_channel(r.get("ds_counts"))
+                            tuned_ch = _best_channel(r.get("tuned_counts"))
+                            enc = "OPEN"
+                            if r.get("privacy"):
+                                if r.get("wpa2"):
+                                    enc = "WPA2"
+                                elif r.get("wpa"):
+                                    enc = "WPA"
+                                else:
+                                    enc = "WEP"
+                            sys.stdout.write(
+                                f"ds={ds_ch:02d} tuned={tuned_ch:02d} bssid={str(r.get('bssid', ''))} seen={int(r.get('seen', 0))} enc={enc} ssid={ssid}\n"
+                            )
+                        sys.stdout.flush()
             finally:
                 if pcap is not None:
                     pcap.flush()
@@ -1865,8 +1973,18 @@ def main(argv: list[str]) -> int:
                     ssid = "<hidden>"
                 ds_ch = _best_channel(r.get("ds_counts"))
                 tuned_ch = _best_channel(r.get("tuned_counts"))
+                
+                enc = "OPEN"
+                if r.get("privacy"):
+                    if r.get("wpa2"):
+                        enc = "WPA2"
+                    elif r.get("wpa"):
+                        enc = "WPA"
+                    else:
+                        enc = "WEP"
+
                 sys.stdout.write(
-                    f"ds={ds_ch:02d} tuned={tuned_ch:02d} bssid={str(r.get('bssid', ''))} seen={int(r.get('seen', 0))} ssid={ssid}\n"
+                    f"ds={ds_ch:02d} tuned={tuned_ch:02d} bssid={str(r.get('bssid', ''))} seen={int(r.get('seen', 0))} enc={enc} ssid={ssid}\n"
                 )
             sys.stdout.flush()
             if bool(args.scan_summary):

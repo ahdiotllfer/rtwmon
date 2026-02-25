@@ -4,9 +4,10 @@ import struct
 import sys
 import time
 import zlib
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Callable
 
 
 def _libusb_error_name(lib, code: int) -> str:
@@ -616,23 +617,27 @@ def _parse_channel_spec(spec: str) -> List[int]:
     return out
 
 
-def _extract_mgmt_ssid_and_channel(payload: bytes) -> Tuple[Optional[str], Optional[int]]:
+def _extract_ap_info(payload: bytes) -> Optional[dict]:
     if len(payload) < 24:
-        return None, None
+        return None
     fc = int.from_bytes(payload[0:2], "little")
     ftype = (fc >> 2) & 0x3
     subtype = (fc >> 4) & 0xF
     if ftype != 0 or subtype not in (5, 8):
-        return None, None
+        return None
 
     fixed_len = 12
     ies_off = 24 + fixed_len
     if len(payload) < ies_off:
-        return None, None
-    ies = payload[ies_off:]
+        return None
+    
+    info = {'ssid': None, 'channel': None, 'privacy': False, 'wpa': 0, 'wpa2': 0}
+    if len(payload) >= 36:
+        cap_info = int.from_bytes(payload[34:36], "little")
+        if cap_info & 0x0010:
+            info['privacy'] = True
 
-    ssid: Optional[str] = None
-    channel: Optional[int] = None
+    ies = payload[ies_off:]
     off = 0
     while off + 2 <= len(ies):
         eid = ies[off]
@@ -641,19 +646,24 @@ def _extract_mgmt_ssid_and_channel(payload: bytes) -> Tuple[Optional[str], Optio
         if off + elen > len(ies):
             break
         data = ies[off : off + elen]
-        off += elen
-
+        
         if eid == 0:
             if elen == 0:
-                ssid = ""
+                info['ssid'] = ""
             else:
-                ssid = data.decode("utf-8", errors="replace")
-        elif eid == 3 and elen == 1:
+                info['ssid'] = data.decode("utf-8", errors="replace")
+        elif eid == 3 and elen >= 1:
             ch = data[0]
             if 1 <= ch <= 14:
-                channel = ch
+                info['channel'] = int(ch)
+        elif eid == 48:
+            info['wpa2'] = 1
+        elif eid == 221:
+            if len(data) >= 4 and data.startswith(b'\x00\x50\xf2\x01'):
+                info['wpa'] = 1
 
-    return ssid, channel
+        off += elen
+    return info
 
 
 def _chan_to_freq_mhz(ch: int) -> int:
@@ -1367,11 +1377,19 @@ class RTL8188EU:
         timeout_ms: int,
         good_fcs_only: bool,
         include_bad_fcs: bool,
+        forever: bool = False,
+        callback: Optional[Callable[[Dict], None]] = None,
     ) -> Dict[Tuple[str, str], Dict[str, object]]:
         if self.ep_in is None:
             raise RuntimeError("Device not opened")
         results: Dict[Tuple[str, str], Dict[str, object]] = {}
-        for ch in channels:
+        stations_by_bssid: Dict[str, Dict[str, int]] = {}
+        
+        scan_iter = channels
+        if forever:
+            scan_iter = itertools.cycle(channels)
+            
+        for ch in scan_iter:
             self.set_channel(ch, bw=20)
             end = time.monotonic() + (dwell_ms / 1000.0)
             while time.monotonic() < end:
@@ -1392,22 +1410,76 @@ class RTL8188EU:
                     fc = int.from_bytes(payload[0:2], "little") if len(payload) >= 2 else 0
                     ftype = (fc >> 2) & 0x3
                     subtype = (fc >> 4) & 0xF
+
+                    try:
+                        sta_mac: Optional[str] = None
+                        frame_bssid: Optional[str] = None
+                        if ftype == 2:
+                            to_ds = bool((fc >> 8) & 0x1)
+                            from_ds = bool((fc >> 9) & 0x1)
+                            a1, a2, a3, _a4, _ftype2, _subtype2, _seq = _parse_addrs(payload)
+                            if not from_ds and to_ds:
+                                if _is_unicast_mac(a1) and _is_unicast_mac(a2) and a1 != a2:
+                                    frame_bssid = _fmt_mac(a1)
+                                    sta_mac = _fmt_mac(a2)
+                            elif from_ds and not to_ds:
+                                if _is_unicast_mac(a2) and _is_unicast_mac(a1) and a1 != a2:
+                                    frame_bssid = _fmt_mac(a2)
+                                    sta_mac = _fmt_mac(a1)
+                        elif ftype == 0:
+                            a1, a2, a3, _a4, _ftype2, _subtype2, _seq = _parse_addrs(payload)
+                            a1_s = _fmt_mac(a1) if _is_unicast_mac(a1) else None
+                            a2_s = _fmt_mac(a2) if _is_unicast_mac(a2) else None
+                            a3_s = _fmt_mac(a3) if _is_unicast_mac(a3) else None
+                            if a3_s is not None:
+                                frame_bssid = a3_s
+                                if a2_s is not None and a2_s != a3_s:
+                                    sta_mac = a2_s
+                                elif a1_s is not None and a1_s != a3_s:
+                                    sta_mac = a1_s
+
+                        if frame_bssid and sta_mac and frame_bssid != sta_mac:
+                            st = stations_by_bssid.get(frame_bssid)
+                            if st is None:
+                                st = {}
+                                stations_by_bssid[frame_bssid] = st
+                            prev_seen = int(st.get(sta_mac, 0))
+                            st[sta_mac] = prev_seen + 1
+                            if prev_seen == 0:
+                                sys.stdout.write(f"ch={int(ch):02d} sta={sta_mac} bssid={frame_bssid} seen=1\n")
+                                sys.stdout.flush()
+                    except Exception:
+                        pass
+
                     if ftype != 0 or subtype not in (5, 8):
                         continue
                     a1, a2, a3, _a4, _ftype2, _subtype2, _seq = _parse_addrs(payload)
                     bssid = _fmt_mac(a3 or b"")
-                    ssid, ch_ie = _extract_mgmt_ssid_and_channel(payload)
-                    if ssid is None:
+                    info = _extract_ap_info(payload)
+                    if info is None or info['ssid'] is None:
                         continue
+                    ssid = info['ssid']
+                    ch_ie = info['channel']
                     ch_eff = ch_ie if ch_ie is not None else ch
                     key = (bssid, ssid)
                     row = results.get(key)
                     if row is None:
-                        results[key] = {"bssid": bssid, "ssid": ssid, "channel": ch_eff, "seen": 1, "tsfl": desc.tsfl}
+                        results[key] = {
+                            "bssid": bssid, 
+                            "ssid": ssid, 
+                            "channel": ch_eff, 
+                            "seen": 1, 
+                            "tsfl": desc.tsfl,
+                            "privacy": info['privacy'],
+                            "wpa": info['wpa'],
+                            "wpa2": info['wpa2']
+                        }
                     else:
                         row["seen"] = int(row["seen"]) + 1
                         row["tsfl"] = desc.tsfl
                         row["channel"] = ch_eff
+            if callback:
+                callback(results)
         return results
 
     def scan_stations(
@@ -1783,6 +1855,8 @@ class RTL8188EU:
         rx_reads = 0
         written = 0
         bssid_bytes = bytes.fromhex(bssid.replace(":", "").replace("-", ""))
+        bssid_s = bssid.lower()
+        stations: Dict[str, int] = {}
         next_status = start + 1.0
 
         while True:
@@ -1816,6 +1890,59 @@ class RTL8188EU:
                 if _fc_version(payload) != 0:
                     continue
                 frame = payload
+                try:
+                    fc = int.from_bytes(frame[0:2], "little") if len(frame) >= 2 else 0
+                    ftype = (fc >> 2) & 0x3
+                    subtype = (fc >> 4) & 0xF
+
+                    sta_mac: Optional[str] = None
+                    frame_bssid: Optional[str] = None
+                    if ftype == 2:
+                        to_ds = bool((fc >> 8) & 0x1)
+                        from_ds = bool((fc >> 9) & 0x1)
+                        a1, a2, _a3, _a4, _ftype2, _subtype2, _seq = _parse_addrs(frame)
+                        if not from_ds and to_ds:
+                            if _is_unicast_mac(a1) and _is_unicast_mac(a2) and a1 != a2:
+                                frame_bssid = _fmt_mac(a1)
+                                sta_mac = _fmt_mac(a2)
+                        elif from_ds and not to_ds:
+                            if _is_unicast_mac(a2) and _is_unicast_mac(a1) and a1 != a2:
+                                frame_bssid = _fmt_mac(a2)
+                                sta_mac = _fmt_mac(a1)
+                    elif ftype == 1 and subtype in (8, 10, 11):
+                        if len(frame) >= 16:
+                            ra = frame[4:10]
+                            ta = frame[10:16]
+                            ra_s = _fmt_mac(ra) if _is_unicast_mac(ra) else None
+                            ta_s = _fmt_mac(ta) if _is_unicast_mac(ta) else None
+                            if ra_s == bssid_s and ta_s is not None:
+                                frame_bssid = ra_s
+                                sta_mac = ta_s
+                            elif ta_s == bssid_s and ra_s is not None:
+                                frame_bssid = ta_s
+                                sta_mac = ra_s
+                    elif ftype == 0 and subtype in (0, 2, 10, 11, 12):
+                        a1, a2, a3, _a4, _ftype2, _subtype2, _seq = _parse_addrs(frame)
+                        a1_s = _fmt_mac(a1) if _is_unicast_mac(a1) else None
+                        a2_s = _fmt_mac(a2) if _is_unicast_mac(a2) else None
+                        a3_s = _fmt_mac(a3) if _is_unicast_mac(a3) else None
+                        if a3_s == bssid_s:
+                            frame_bssid = a3_s
+                            if a2_s is not None and a2_s != bssid_s:
+                                sta_mac = a2_s
+                            elif a1_s is not None and a1_s != bssid_s:
+                                sta_mac = a1_s
+
+                    if frame_bssid == bssid_s and sta_mac:
+                        prev = int(stations.get(sta_mac, 0))
+                        stations[sta_mac] = prev + 1
+                        if prev == 0:
+                            sys.stdout.write(
+                                f"ch={int(self.current_channel):02d} sta={sta_mac} bssid={bssid_s} seen=1\n"
+                            )
+                            sys.stdout.flush()
+                except Exception:
+                    pass
                 has_fcs = False
                 if desc.crc32 or desc.icverr:
                     pass
@@ -2065,6 +2192,30 @@ def main(argv: Sequence[str]) -> int:
             if not channels:
                 sys.stderr.write("No valid channels for --scan-channels\n")
                 return 2
+            def print_scan_results(res):
+                rows = list(res.values())
+                if args.target_ssid:
+                    target = args.target_ssid.strip()
+                    rows = [r for r in rows if str(r["ssid"]).strip() == target]
+                rows.sort(key=lambda r: (int(r["channel"]), str(r["ssid"])))
+                for r in rows:
+                    ssid = r["ssid"]
+                    if ssid == "":
+                        ssid = "<hidden>"
+                    enc = "OPEN"
+                    if r.get("privacy"):
+                        if r.get("wpa2"):
+                            enc = "WPA2"
+                        elif r.get("wpa"):
+                            enc = "WPA"
+                        else:
+                            enc = "WEP"
+                    sys.stdout.write(
+                        f"ch={int(r['channel']):02d} bssid={r['bssid']} seen={int(r['seen'])} enc={enc} ssid={ssid}\n"
+                    )
+                sys.stdout.flush()
+
+            forever = not bool(args.target_ssid)
             results = chip.scan_passive(
                 channels=channels,
                 dwell_ms=args.dwell_ms,
@@ -2072,41 +2223,34 @@ def main(argv: Sequence[str]) -> int:
                 timeout_ms=args.timeout_ms,
                 good_fcs_only=args.good_fcs_only,
                 include_bad_fcs=args.scan_include_bad_fcs,
+                forever=forever,
+                callback=print_scan_results if forever else None
             )
-            rows = list(results.values())
-            if args.target_ssid:
-                target = args.target_ssid.strip()
-                rows = [r for r in rows if str(r["ssid"]).strip() == target]
-            rows.sort(key=lambda r: (int(r["channel"]), str(r["ssid"])))
-            for r in rows:
-                ssid = r["ssid"]
-                if ssid == "":
-                    ssid = "<hidden>"
-                sys.stdout.write(
-                    f"ch={int(r['channel']):02d} bssid={r['bssid']} seen={int(r['seen'])} ssid={ssid}\n"
-                )
-            sys.stdout.flush()
+            if not forever:
+                print_scan_results(results)
 
-            if args.target_ssid and rows:
-                for r in rows:
-                    bssid = str(r["bssid"])
-                    channel = int(r["channel"])
-                    ssid = str(r["ssid"]) or "<hidden>"
-                    sys.stdout.write(
-                        f"Scanning stations for SSID='{ssid}' BSSID={bssid} on channel {channel}...\n"
-                    )
-                    stations = chip.scan_stations(
-                        bssid=bssid,
-                        channel=channel,
-                        duration_ms=args.station_scan_time,
-                        read_size=args.read_size,
-                        timeout_ms=args.timeout_ms,
-                        good_fcs_only=args.good_fcs_only,
-                        include_bad_fcs=True,
-                    )
-                    for sta in stations.values():
-                        sys.stdout.write(f"  Station: {sta['mac']} seen={sta['seen']}\n")
-                sys.stdout.flush()
+            if args.target_ssid:
+                rows = list(results.values())
+                if rows:
+                    for r in rows:
+                        bssid = str(r["bssid"])
+                        channel = int(r["channel"])
+                        ssid = str(r["ssid"]) or "<hidden>"
+                        sys.stdout.write(
+                            f"Scanning stations for SSID='{ssid}' BSSID={bssid} on channel {channel}...\n"
+                        )
+                        stations = chip.scan_stations(
+                            bssid=bssid,
+                            channel=channel,
+                            duration_ms=args.station_scan_time,
+                            read_size=args.read_size,
+                            timeout_ms=args.timeout_ms,
+                            good_fcs_only=args.good_fcs_only,
+                            include_bad_fcs=True,
+                        )
+                        for sta in stations.values():
+                            sys.stdout.write(f"  Station: {sta['mac']} seen={sta['seen']}\n")
+                    sys.stdout.flush()
             return 0
         if args.disassoc or args.deauth:
             if not args.target_mac or not args.bssid:

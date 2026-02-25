@@ -243,6 +243,7 @@ def main(argv: Sequence[str]) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("info")
+    sub.add_parser("list", help="List detected compatible devices")
 
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("--channels", default="1-11")
@@ -307,6 +308,34 @@ def main(argv: Sequence[str]) -> int:
     want_vid = getattr(args, "vid", None)
     want_pid = getattr(args, "pid", None)
 
+    if args.cmd == "list":
+        try:
+            import usb.core
+            found_devs = list(usb.core.find(find_all=True) or [])
+            for d in found_devs:
+                dv = int(getattr(d, "idVendor", 0) or 0)
+                dp = int(getattr(d, "idProduct", 0) or 0)
+                drv = _pick_driver(dv, dp)
+                if drv:
+                    bus = int(getattr(d, "bus", -1) or -1)
+                    addr = int(getattr(d, "address", -1) or -1)
+                    print(f"{drv}:{dv:04x}:{dp:04x}:{bus}:{addr}")
+        except ImportError:
+            # Fallback to lsusb parsing if pyusb not available/working
+            try:
+                out = subprocess.check_output(["lsusb"], stderr=subprocess.DEVNULL, text=True)
+                for bs, ds, vs, ps in re.findall(r"Bus\s+([0-9]+)\s+Device\s+([0-9]+):\s+ID\s+([0-9a-fA-F]{4}):([0-9a-fA-F]{4})", out):
+                    b = int(bs, 10)
+                    a = int(ds, 10)
+                    dv = int(vs, 16)
+                    dp = int(ps, 16)
+                    drv = _pick_driver(dv, dp)
+                    if drv:
+                        print(f"{drv}:{dv:04x}:{dp:04x}:{b}:{a}")
+            except Exception:
+                pass
+        return 0
+
     if str(getattr(args, "driver", "auto")) != "auto":
         driver = str(args.driver)
         detected = None
@@ -334,11 +363,12 @@ def main(argv: Sequence[str]) -> int:
 
     use_8188eu_bin = False
     if driver == "8188eu":
+        use_8188eu_bin = str(os.environ.get("RTWMON_USE_8188EU_BIN", "0")).strip() in ("1", "true", "yes")
         bin_path = Path(_script_path(SUPPORTED["8188eu"]["bin"]))
-        if bin_path.is_file() and os.access(str(bin_path), os.X_OK) and args.cmd in ("scan", "rx", "deauth-burst"):
-            use_8188eu_bin = True
+        if use_8188eu_bin and bin_path.is_file() and os.access(str(bin_path), os.X_OK) and args.cmd in ("scan", "rx", "deauth-burst"):
             prog_abs = str(bin_path)
         else:
+            use_8188eu_bin = False
             prog_abs = _script_path(SUPPORTED["8188eu"]["py"])
     else:
         prog_abs = _script_path(SUPPORTED[driver]["py"])
@@ -377,7 +407,7 @@ def main(argv: Sequence[str]) -> int:
 
     cmd_argv: list[str] = []
     if args.cmd == "scan":
-        if use_8188eu_bin:
+        if driver == "8188eu":
             cmd_argv += [
                 "--scan",
                 "--scan-channels",
@@ -423,10 +453,10 @@ def main(argv: Sequence[str]) -> int:
         if bool(getattr(args, "pcap_with_fcs", False)):
             cmd_argv.append("--pcap-with-fcs")
         igi = int(getattr(args, "igi", -1))
-        if igi >= 0:
+        if driver != "8188eu" and igi >= 0:
             cmd_argv += ["--igi", str(igi)]
     elif args.cmd == "rx":
-        if use_8188eu_bin:
+        if driver == "8188eu":
             cmd_argv += [
                 "--rx",
                 "--channel",
@@ -457,30 +487,49 @@ def main(argv: Sequence[str]) -> int:
         if bool(getattr(args, "pcap_with_fcs", False)):
             cmd_argv.append("--pcap-with-fcs")
         igi = int(getattr(args, "igi", -1))
-        if igi >= 0:
+        if driver != "8188eu" and igi >= 0:
             cmd_argv += ["--igi", str(igi)]
     elif args.cmd == "deauth":
-        cmd_argv += [
-            "deauth",
-            "--channel",
-            str(int(getattr(args, "channel", 1))),
-            "--bw",
-            str(int(getattr(args, "bw", 20))),
-            "--target-mac",
-            str(getattr(args, "target_mac")),
-            "--bssid",
-            str(getattr(args, "bssid")),
-            "--reason",
-            str(int(getattr(args, "reason", 7))),
-            "--count",
-            str(int(getattr(args, "count", 1))),
-            "--delay-ms",
-            str(int(getattr(args, "delay_ms", 100))),
-        ]
+        if driver == "8188eu":
+            cmd_argv += [
+                "--deauth",
+                "--channel",
+                str(int(getattr(args, "channel", 1))),
+                "--bw",
+                str(int(getattr(args, "bw", 20))),
+                "--target-mac",
+                str(getattr(args, "target_mac")),
+                "--bssid",
+                str(getattr(args, "bssid")),
+                "--reason",
+                str(int(getattr(args, "reason", 7))),
+                "--count",
+                str(int(getattr(args, "count", 1))),
+                "--delay-ms",
+                str(int(getattr(args, "delay_ms", 100))),
+            ]
+        else:
+            cmd_argv += [
+                "deauth",
+                "--channel",
+                str(int(getattr(args, "channel", 1))),
+                "--bw",
+                str(int(getattr(args, "bw", 20))),
+                "--target-mac",
+                str(getattr(args, "target_mac")),
+                "--bssid",
+                str(getattr(args, "bssid")),
+                "--reason",
+                str(int(getattr(args, "reason", 7))),
+                "--count",
+                str(int(getattr(args, "count", 1))),
+                "--delay-ms",
+                str(int(getattr(args, "delay_ms", 100))),
+            ]
         if getattr(args, "source_mac", None):
             cmd_argv += ["--source-mac", str(getattr(args, "source_mac"))]
     elif args.cmd == "deauth-burst":
-        if use_8188eu_bin:
+        if driver == "8188eu":
             cmd_argv += [
                 "--deauth-burst",
                 "--channel",

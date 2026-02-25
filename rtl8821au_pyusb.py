@@ -7,6 +7,7 @@ import shutil
 import sys
 import time
 import zlib
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -2177,24 +2178,30 @@ def _print_4way_if_present(payload: bytes) -> None:
     sys.stderr.write(f"4wh msg{msg} bssid={bssid_s} sta={sta_s} replay={replay} key_info=0x{key_info:04x}\n")
     sys.stderr.flush()
 
-def _extract_mgmt_ssid_and_channel(payload: bytes) -> tuple[Optional[str], Optional[int]]:
-    def _inner(p: bytes) -> tuple[Optional[str], Optional[int]]:
+def _extract_ap_info(payload: bytes) -> Optional[dict]:
+    def _inner(p: bytes) -> Optional[dict]:
         if len(p) < 24:
-            return None, None
+            return None
         fc = int.from_bytes(p[0:2], "little")
         ftype = (fc >> 2) & 0x3
         subtype = (fc >> 4) & 0xF
         if ftype != 0 or subtype not in (5, 8):
-            return None, None
+            return None
 
         fixed_len = 12
         ies_off = 24 + fixed_len
         if len(p) < ies_off:
-            return None, None
-        ies = p[ies_off:]
+            return None
+        
+        info = {'ssid': None, 'channel': None, 'privacy': False, 'wpa': 0, 'wpa2': 0}
+        
+        # Capability Info at offset 34
+        if len(p) >= 36:
+            cap_info = int.from_bytes(p[34:36], "little")
+            if cap_info & 0x0010:
+                info['privacy'] = True
 
-        ssid: Optional[str] = None
-        channel: Optional[int] = None
+        ies = p[ies_off:]
         off = 0
         while off + 2 <= len(ies):
             eid = ies[off]
@@ -2203,25 +2210,31 @@ def _extract_mgmt_ssid_and_channel(payload: bytes) -> tuple[Optional[str], Optio
             if off + elen > len(ies):
                 break
             data = ies[off : off + elen]
-            off += elen
-
+            
             if eid == 0:
                 if elen == 0:
-                    ssid = ""
+                    info['ssid'] = ""
                 else:
-                    ssid = data.decode("utf-8", errors="replace")
-            elif eid == 3 and elen == 1:
+                    info['ssid'] = data.decode("utf-8", errors="replace")
+            elif eid == 3 and elen >= 1:
                 ch = data[0]
                 if 1 <= ch <= 165:
-                    channel = int(ch)
-        return ssid, channel
+                    info['channel'] = int(ch)
+            elif eid == 48: # RSN
+                info['wpa2'] = 1
+            elif eid == 221: # Vendor
+                if len(data) >= 4 and data.startswith(b'\x00\x50\xf2\x01'):
+                    info['wpa'] = 1
+            
+            off += elen
+        return info
 
-    ssid, ch = _inner(payload)
-    if ssid is not None:
-        return ssid, ch
+    res = _inner(payload)
+    if res is not None and res['ssid'] is not None:
+        return res
     if len(payload) >= 28:
         return _inner(payload[:-4])
-    return None, None
+    return None
 
 
 def main(argv: list[str]) -> int:
@@ -2870,6 +2883,7 @@ def main(argv: list[str]) -> int:
                         print(f"[scan] altsetting probe failed: {e}")
 
             results: dict[tuple[str, str], dict[str, object]] = {}
+            stations_by_bssid: dict[str, dict[str, int]] = {}
             total_urbs = 0
             total_bytes = 0
             total_pkts = 0
@@ -2877,7 +2891,10 @@ def main(argv: list[str]) -> int:
             total_bcn = 0
             total_prb = 0
             dumped = 0
-            for ch in channels:
+            scan_iter = channels
+            if not args.target_ssid:
+                scan_iter = itertools.cycle(channels)
+            for ch in scan_iter:
                 try:
                     dev.set_channel(ch, bandwidth_mhz=args.bw)
                 except Exception:
@@ -2920,6 +2937,42 @@ def main(argv: list[str]) -> int:
                                     dumped += 1
                                 continue
                             a1, a2, a3, _a4, ftype, subtype, _seq = _parse_addrs(frame)
+                            try:
+                                sta_mac: Optional[str] = None
+                                frame_bssid: Optional[str] = None
+                                if ftype == 2:
+                                    fc = int.from_bytes(frame[0:2], "little") if len(frame) >= 2 else 0
+                                    to_ds = bool((fc >> 8) & 0x1)
+                                    from_ds = bool((fc >> 9) & 0x1)
+                                    if to_ds and not from_ds:
+                                        if a1 is not None and a2 is not None and _is_unicast_mac(a1) and _is_unicast_mac(a2) and a1 != a2:
+                                            frame_bssid = _fmt_mac(a1)
+                                            sta_mac = _fmt_mac(a2)
+                                    elif from_ds and not to_ds:
+                                        if a1 is not None and a2 is not None and _is_unicast_mac(a2) and _is_unicast_mac(a1) and a1 != a2:
+                                            frame_bssid = _fmt_mac(a2)
+                                            sta_mac = _fmt_mac(a1)
+                                elif ftype == 0 and a3 is not None and _is_unicast_mac(a3):
+                                    frame_bssid = _fmt_mac(a3)
+                                    a1_s = _fmt_mac(a1) if a1 is not None and _is_unicast_mac(a1) else None
+                                    a2_s = _fmt_mac(a2) if a2 is not None and _is_unicast_mac(a2) else None
+                                    if a2_s is not None and a2_s != frame_bssid:
+                                        sta_mac = a2_s
+                                    elif a1_s is not None and a1_s != frame_bssid:
+                                        sta_mac = a1_s
+
+                                if frame_bssid and sta_mac and frame_bssid != sta_mac:
+                                    st = stations_by_bssid.get(frame_bssid)
+                                    if st is None:
+                                        st = {}
+                                        stations_by_bssid[frame_bssid] = st
+                                    prev_seen = int(st.get(sta_mac, 0))
+                                    st[sta_mac] = prev_seen + 1
+                                    if prev_seen == 0:
+                                        print(f"ch={int(ch):02d} sta={sta_mac} bssid={frame_bssid} seen=1")
+                                        sys.stdout.flush()
+                            except Exception:
+                                pass
                             if ftype != 0 or subtype not in (5, 8) or a3 is None:
                                 if args.debug and args.scan_dump and dumped < int(args.scan_dump):
                                     fc = int.from_bytes(frame[0:2], "little") if len(frame) >= 2 else 0
@@ -2932,9 +2985,11 @@ def main(argv: list[str]) -> int:
                                 ch_bcn += 1
                             elif subtype == 5:
                                 ch_prb += 1
-                            ssid, ch_ie = _extract_mgmt_ssid_and_channel(frame)
-                            if ssid is None:
+                            info = _extract_ap_info(frame)
+                            if info is None or info['ssid'] is None:
                                 continue
+                            ssid = info['ssid']
+                            ch_ie = info['channel']
                             bssid = _fmt_mac(a3)
                             ch_eff = int(ch)
                             if ch_ie is not None:
@@ -2947,7 +3002,15 @@ def main(argv: list[str]) -> int:
                             key = (bssid, ssid)
                             prev = results.get(key)
                             if prev is None:
-                                results[key] = {"bssid": bssid, "ssid": ssid, "channel": ch_eff, "seen": 1}
+                                results[key] = {
+                                    "bssid": bssid, 
+                                    "ssid": ssid, 
+                                    "channel": ch_eff, 
+                                    "seen": 1,
+                                    "privacy": info['privacy'],
+                                    "wpa": info['wpa'],
+                                    "wpa2": info['wpa2']
+                                }
                                 ch_new += 1
                             else:
                                 prev["seen"] = int(prev["seen"]) + 1
@@ -2964,6 +3027,24 @@ def main(argv: list[str]) -> int:
                         f" mgmt={ch_mgmt} bcn={ch_bcn} prb={ch_prb} new={ch_new}"
                     )
 
+                if not args.target_ssid:
+                    rows_rt = list(results.values())
+                    rows_rt.sort(key=lambda r: (int(r["channel"]), str(r["ssid"])))
+                    for r in rows_rt:
+                        ssid = str(r["ssid"])
+                        if ssid == "":
+                            ssid = "<hidden>"
+                        enc = "OPEN"
+                        if r.get("privacy"):
+                            if r.get("wpa2"):
+                                enc = "WPA2"
+                            elif r.get("wpa"):
+                                enc = "WPA"
+                            else:
+                                enc = "WEP"
+                        print(f"ch={int(r['channel']):02d} bssid={r['bssid']} seen={int(r['seen'])} enc={enc} ssid={ssid}")
+                    sys.stdout.flush()
+
             rows = list(results.values())
             if args.target_ssid:
                 target = str(args.target_ssid).strip()
@@ -2978,7 +3059,17 @@ def main(argv: list[str]) -> int:
                 ssid = str(r["ssid"])
                 if ssid == "":
                     ssid = "<hidden>"
-                print(f"ch={int(r['channel']):02d} bssid={r['bssid']} seen={int(r['seen'])} ssid={ssid}")
+                
+                enc = "OPEN"
+                if r.get("privacy"):
+                    if r.get("wpa2"):
+                        enc = "WPA2"
+                    elif r.get("wpa"):
+                        enc = "WPA"
+                    else:
+                        enc = "WEP"
+                
+                print(f"ch={int(r['channel']):02d} bssid={r['bssid']} seen={int(r['seen'])} enc={enc} ssid={ssid}")
 
             if args.target_ssid and rows:
                 if not args.no_sitesurvey_filters:
