@@ -523,6 +523,7 @@ def main(argv: Sequence[str]) -> int:
             ]
         else:
             size_flag = "--size" if driver == "8821au" else "--read-size"
+            target_ssid = str(getattr(args, "target_ssid", "") or "")
             cmd_argv += [
                 "scan",
                 "--channels",
@@ -536,10 +537,12 @@ def main(argv: Sequence[str]) -> int:
                 size_flag,
                 str(int(getattr(args, "read_size", 32768))),
                 "--target-ssid",
-                str(getattr(args, "target_ssid", "")),
+                target_ssid,
                 "--station-scan-ms",
                 str(int(getattr(args, "station_scan_ms", 5000))),
             ]
+            if driver in ("8821au", "8822bu") and not target_ssid:
+                cmd_argv.append("--forever")
         if bool(getattr(args, "scan_include_bad_fcs", False)):
             cmd_argv.append("--scan-include-bad-fcs")
         if bool(getattr(args, "pcap", "")):
