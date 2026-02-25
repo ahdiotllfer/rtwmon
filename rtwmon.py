@@ -1,10 +1,13 @@
 import argparse
+import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, List
 
 
 SUPPORTED = {
@@ -121,6 +124,16 @@ def _autodetect_driver(
             raise RuntimeError(f"Unsupported USB device via fd: {v:04x}:{p:04x}")
         return drv, (v, p)
 
+    if _has_termux_usb() and bus is not None and address is not None and int(bus) >= 0 and int(address) >= 0:
+        path = _termux_usb_device_path(int(bus), int(address))
+        vpid = _termux_vid_pid_for_device_path(path)
+        if vpid is not None:
+            v, p = vpid
+            drv = _pick_driver(v, p)
+            if drv is None:
+                raise RuntimeError(f"Unsupported USB device via termux-usb: {v:04x}:{p:04x}")
+            return drv, (v, p)
+
     if vid is not None and pid is not None:
         drv = _pick_driver(int(vid), int(pid))
         if drv is not None:
@@ -216,13 +229,72 @@ def _script_path(name: str) -> str:
     return str(p)
 
 
-def _exec_backend(prog: str, argv: Sequence[str]) -> int:
+def _has_termux_usb() -> bool:
+    return shutil.which("termux-usb") is not None
+
+
+def _termux_usb_list_paths() -> List[str]:
+    try:
+        out = subprocess.check_output(["termux-usb", "-l"], stderr=subprocess.DEVNULL, text=True)
+    except Exception:
+        return []
+    s = out.strip()
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        if isinstance(v, list):
+            return [str(x) for x in v if isinstance(x, str)]
+    except Exception:
+        pass
+    paths = []
+    for line in s.splitlines():
+        line = line.strip().strip(",")
+        if "/dev/bus/usb/" in line:
+            m = re.search(r"(/dev/bus/usb/\d+/\d+)", line)
+            if m:
+                paths.append(m.group(1))
+    return paths
+
+
+def _termux_usb_device_path(bus: int, address: int) -> str:
+    return f"/dev/bus/usb/{int(bus):03d}/{int(address):03d}"
+
+
+def _termux_vid_pid_for_device_path(device_path: str) -> Optional[Tuple[int, int]]:
+    py = os.environ.get("PYTHON", "python3")
+    cmd_list = [py, str(Path(__file__).resolve()), "_termux-vidpid"]
+    cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
+    try:
+        out = subprocess.check_output(
+            ["termux-usb", "-r", "-e", cmd_str, str(device_path)],
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception:
+        return None
+    for line in reversed(out.splitlines()):
+        m = re.search(r"\b([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\b", line.strip())
+        if not m:
+            continue
+        try:
+            return int(m.group(1), 16), int(m.group(2), 16)
+        except Exception:
+            return None
+    return None
+
+
+def _exec_backend(prog: str, argv: Sequence[str], *, termux_device_path: Optional[str] = None) -> int:
     if str(prog).endswith(".py"):
         py = os.environ.get("PYTHON", "python3")
         cmd = [py, prog, *argv]
     else:
         cmd = [prog, *argv]
-    r = subprocess.run(cmd).returncode
+    if termux_device_path and _has_termux_usb():
+        cmd_str = " ".join(shlex.quote(x) for x in cmd)
+        r = subprocess.run(["termux-usb", "-r", "-e", cmd_str, str(termux_device_path)]).returncode
+    else:
+        r = subprocess.run(cmd).returncode
     return int(r)
 
 
@@ -244,6 +316,7 @@ def main(argv: Sequence[str]) -> int:
 
     sub.add_parser("info")
     sub.add_parser("list", help="List detected compatible devices")
+    sub.add_parser("_termux-vidpid")
 
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("--channels", default="1-11")
@@ -308,7 +381,30 @@ def main(argv: Sequence[str]) -> int:
     want_vid = getattr(args, "vid", None)
     want_pid = getattr(args, "pid", None)
 
+    if args.cmd == "_termux-vidpid":
+        if usb_fd < 0:
+            raise RuntimeError("missing usb fd")
+        v, p = _detect_vid_pid_from_usb_fd(usb_fd)
+        sys.stdout.write(f"{v:04x}:{p:04x}\n")
+        return 0
+
     if args.cmd == "list":
+        if _has_termux_usb():
+            paths = _termux_usb_list_paths()
+            for device_path in paths:
+                m = re.search(r"/dev/bus/usb/([0-9]+)/([0-9]+)", device_path)
+                if not m:
+                    continue
+                bus = int(m.group(1), 10)
+                addr = int(m.group(2), 10)
+                vpid = _termux_vid_pid_for_device_path(device_path)
+                if vpid is None:
+                    continue
+                dv, dp = vpid
+                drv = _pick_driver(dv, dp)
+                if drv:
+                    print(f"{drv}:{dv:04x}:{dp:04x}:{bus}:{addr}")
+            return 0
         try:
             import usb.core
             found_devs = list(usb.core.find(find_all=True) or [])
@@ -591,7 +687,14 @@ def main(argv: Sequence[str]) -> int:
     if extra:
         cmd_argv += list(extra)
 
-    return _exec_backend(prog_abs, [*fwd, *cmd_argv])
+    termux_dev: Optional[str] = None
+    if _has_termux_usb() and usb_fd < 0:
+        bus = int(getattr(args, "bus", -1))
+        addr = int(getattr(args, "address", -1))
+        if bus >= 0 and addr >= 0:
+            termux_dev = _termux_usb_device_path(bus, addr)
+
+    return _exec_backend(prog_abs, [*fwd, *cmd_argv], termux_device_path=termux_dev)
 
 
 if __name__ == "__main__":
