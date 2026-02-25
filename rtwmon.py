@@ -124,6 +124,10 @@ def _autodetect_driver(
             raise RuntimeError(f"Unsupported USB device via fd: {v:04x}:{p:04x}")
         return drv, (v, p)
 
+    if _has_termux_usb() and (bus is None or int(bus) < 0) and (address is None or int(address) < 0):
+        drv, v, p, _b, _a, _path = _termux_select_supported_device()
+        return drv, (v, p)
+
     if _has_termux_usb() and bus is not None and address is not None and int(bus) >= 0 and int(address) >= 0:
         path = _termux_usb_device_path(int(bus), int(address))
         vpid = _termux_vid_pid_for_device_path(path)
@@ -282,6 +286,36 @@ def _termux_vid_pid_for_device_path(device_path: str) -> Optional[Tuple[int, int
         except Exception:
             return None
     return None
+
+
+def _termux_select_supported_device() -> Tuple[str, int, int, int, int, str]:
+    paths = _termux_usb_list_paths()
+    supported: list[tuple[str, int, int, int, int, str]] = []
+    for device_path in paths:
+        m = re.search(r"/dev/bus/usb/([0-9]+)/([0-9]+)", str(device_path))
+        if not m:
+            continue
+        bus = int(m.group(1), 10)
+        addr = int(m.group(2), 10)
+        vpid = _termux_vid_pid_for_device_path(str(device_path))
+        if vpid is None:
+            continue
+        v, p = vpid
+        drv = _pick_driver(v, p)
+        if drv is None:
+            continue
+        supported.append((drv, int(v), int(p), int(bus), int(addr), str(device_path)))
+
+    uniq = {(d, v, p, b, a, path) for (d, v, p, b, a, path) in supported}
+    if len(uniq) == 1:
+        return next(iter(uniq))
+    if len(uniq) > 1:
+        rows = sorted(list(uniq), key=lambda x: (x[0], x[1], x[2], x[3], x[4]))
+        parts = [f"{d}:{v:04x}:{p:04x} (bus={b}, address={a})" for (d, v, p, b, a, _path) in rows]
+        raise RuntimeError(
+            "Multiple supported adapters detected via termux-usb: " + ", ".join(parts) + ". Use --bus/--address."
+        )
+    raise RuntimeError("No supported Realtek USB adapter found via termux-usb (check termux-usb -l)")
 
 
 def _exec_backend(prog: str, argv: Sequence[str], *, termux_device_path: Optional[str] = None) -> int:
@@ -696,6 +730,12 @@ def main(argv: Sequence[str]) -> int:
         addr = int(getattr(args, "address", -1))
         if bus >= 0 and addr >= 0:
             termux_dev = _termux_usb_device_path(bus, addr)
+        else:
+            try:
+                _drv, _v, _p, sel_bus, sel_addr, sel_path = _termux_select_supported_device()
+                termux_dev = sel_path or _termux_usb_device_path(sel_bus, sel_addr)
+            except Exception:
+                termux_dev = None
 
     return _exec_backend(prog_abs, [*fwd, *cmd_argv], termux_device_path=termux_dev)
 
