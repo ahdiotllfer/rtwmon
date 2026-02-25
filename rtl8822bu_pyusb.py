@@ -1566,6 +1566,9 @@ def main(argv: list[str]) -> int:
             args.usb_fd = usb_fd_auto
         else:
             ap.error("unrecognized arguments: " + " ".join(extra))
+
+    if args.cmd == "scan" and _is_termux() and not bool(getattr(args, "target_ssid", "")) and not bool(getattr(args, "forever", False)):
+        args.forever = True
  
     dev = Rtl8822buUsb(vid=args.vid, pid=args.pid)
     if args.cmd != "replay" or not bool(getattr(args, "dry_run", False)):
