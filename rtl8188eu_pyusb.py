@@ -2238,13 +2238,14 @@ def main(argv: Sequence[str]) -> int:
                 sys.stdout.flush()
 
             forever = bool(args.forever)
+            include_bad = bool(args.scan_include_bad_fcs) or int(getattr(args, "usb_fd", -1)) >= 0
             results = chip.scan_passive(
                 channels=channels,
                 dwell_ms=args.dwell_ms,
                 read_size=args.read_size,
                 timeout_ms=args.timeout_ms,
                 good_fcs_only=args.good_fcs_only,
-                include_bad_fcs=bool(args.scan_include_bad_fcs),
+                include_bad_fcs=include_bad,
                 forever=forever,
                 callback=print_scan_results if forever else None
             )
