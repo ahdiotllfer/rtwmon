@@ -1,10 +1,31 @@
 import argparse
+import os
 import re
 import struct
 import sys
 import time
 import zlib
 import itertools
+
+
+def _is_termux() -> bool:
+    if os.environ.get("TERMUX_VERSION") or os.environ.get("TERMUX_APP_PID"):
+        return True
+    prefix = str(os.environ.get("PREFIX", "") or "")
+    if prefix.startswith("/data/data/com.termux/"):
+        return True
+    return os.path.exists("/data/data/com.termux/files/usr/bin/termux-usb")
+
+
+if _is_termux():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Callable
