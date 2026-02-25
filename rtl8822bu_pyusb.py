@@ -1789,7 +1789,7 @@ def main(argv: list[str]) -> int:
                     pcap = PcapWriter(fp)
 
                 scan_iter = channels
-                if not target_ssid:
+                if not target_ssid and not sys.stdout.isatty():
                     scan_iter = itertools.cycle(channels)
 
                 for ch in scan_iter:

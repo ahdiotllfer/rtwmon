@@ -2913,7 +2913,7 @@ def main(argv: list[str]) -> int:
             total_prb = 0
             dumped = 0
             scan_iter = channels
-            if not args.target_ssid:
+            if not args.target_ssid and not sys.stdout.isatty():
                 scan_iter = itertools.cycle(channels)
             for ch in scan_iter:
                 try:

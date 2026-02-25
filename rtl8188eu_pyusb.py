@@ -2236,7 +2236,7 @@ def main(argv: Sequence[str]) -> int:
                     )
                 sys.stdout.flush()
 
-            forever = not bool(args.target_ssid)
+            forever = (not bool(args.target_ssid)) and (not sys.stdout.isatty())
             results = chip.scan_passive(
                 channels=channels,
                 dwell_ms=args.dwell_ms,
