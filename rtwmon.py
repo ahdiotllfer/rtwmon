@@ -287,7 +287,7 @@ def _termux_vid_pid_for_device_path(device_path: str) -> Optional[Tuple[int, int
 def _exec_backend(prog: str, argv: Sequence[str], *, termux_device_path: Optional[str] = None) -> int:
     if str(prog).endswith(".py"):
         py = os.environ.get("PYTHON", "python3")
-        cmd = [py, prog, *argv]
+        cmd = [py, "-u", prog, *argv]
     else:
         cmd = [prog, *argv]
     if termux_device_path and _has_termux_usb():
