@@ -2876,6 +2876,8 @@ def main(argv: list[str]) -> int:
             if not channels:
                 channels = list(range(1, 14)) + list(range(36, 65)) + list(range(100, 141)) + list(range(149, 166))
             channels_set = set(int(c) for c in channels)
+            if not bool(str(getattr(args, "target_ssid", "")).strip()):
+                args.forever = True
 
             if args.debug:
                 in_eps = ", ".join(f"0x{e.bEndpointAddress:02x}" for e in dev.bulk_in_eps)

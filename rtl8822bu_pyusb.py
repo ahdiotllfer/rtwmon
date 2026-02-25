@@ -1764,6 +1764,8 @@ def main(argv: list[str]) -> int:
 
             target_ssid = str(getattr(args, "target_ssid", "")).strip()
             include_bad = bool(args.scan_include_bad_fcs) or int(getattr(args, "usb_fd", -1)) >= 0
+            if not target_ssid:
+                args.forever = True
 
             def _best_channel(counts: object) -> int:
                 if not isinstance(counts, dict) or not counts:
