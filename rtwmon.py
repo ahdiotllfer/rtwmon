@@ -1,11 +1,14 @@
 import argparse
+import array
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, List
 
@@ -237,6 +240,55 @@ def _has_termux_usb() -> bool:
     return shutil.which("termux-usb") is not None
 
 
+def _is_termux() -> bool:
+    if os.environ.get("TERMUX_VERSION") or os.environ.get("TERMUX_APP_PID"):
+        return True
+    prefix = str(os.environ.get("PREFIX", "") or "")
+    if prefix.startswith("/data/data/com.termux/"):
+        return True
+    return os.path.exists("/data/data/com.termux/files/usr/bin/termux-usb")
+
+
+def _default_fd_server_socket() -> str:
+    s = str(os.environ.get("RTWMON_FD_SERVER_SOCKET", "") or "").strip()
+    if s:
+        return s
+    try:
+        base = tempfile.gettempdir()
+    except Exception:
+        base = "/tmp"
+    return os.path.join(base, "rtwmon-usbfd.sock")
+
+
+def _recv_fd_from_unix_socket(sock_path: str, timeout_s: float = 1.5) -> Optional[int]:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except Exception:
+        return None
+    try:
+        s.settimeout(timeout_s)
+        s.connect(sock_path)
+        try:
+            s.sendall(b"GETFD\n")
+        except Exception:
+            pass
+        fds = array.array("i")
+        msg, ancdata, _flags, _addr = s.recvmsg(4096, socket.CMSG_SPACE(fds.itemsize))
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+                fds.frombytes(cmsg_data[: fds.itemsize])
+                if len(fds) > 0:
+                    return int(fds[0])
+        return None
+    except Exception:
+        return None
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def _termux_usb_list_paths() -> List[str]:
     try:
         out = subprocess.check_output(["termux-usb", "-l"], stderr=subprocess.DEVNULL, text=True)
@@ -318,17 +370,27 @@ def _termux_select_supported_device() -> Tuple[str, int, int, int, int, str]:
     raise RuntimeError("No supported Realtek USB adapter found via termux-usb (check termux-usb -l)")
 
 
-def _exec_backend(prog: str, argv: Sequence[str], *, termux_device_path: Optional[str] = None) -> int:
+def _exec_backend(
+    prog: str,
+    argv: Sequence[str],
+    *,
+    termux_device_path: Optional[str] = None,
+    usb_fd_to_pass: Optional[int] = None,
+) -> int:
     if str(prog).endswith(".py"):
         py = os.environ.get("PYTHON", "python3")
         cmd = [py, "-u", prog, *argv]
     else:
         cmd = [prog, *argv]
+    pass_fds: tuple[int, ...] = ()
+    if usb_fd_to_pass is not None and int(usb_fd_to_pass) >= 0:
+        cmd = [*cmd, str(int(usb_fd_to_pass))]
+        pass_fds = (int(usb_fd_to_pass),)
     if termux_device_path and _has_termux_usb():
         cmd_str = " ".join(shlex.quote(x) for x in cmd)
         r = subprocess.run(["termux-usb", "-r", "-e", cmd_str, str(termux_device_path)]).returncode
     else:
-        r = subprocess.run(cmd).returncode
+        r = subprocess.run(cmd, pass_fds=pass_fds).returncode
     return int(r)
 
 
@@ -351,6 +413,8 @@ def main(argv: Sequence[str]) -> int:
     sub.add_parser("info")
     sub.add_parser("list", help="List detected compatible devices")
     sub.add_parser("_termux-vidpid")
+    p_fdserver = sub.add_parser("fd-server")
+    p_fdserver.add_argument("--socket", default=_default_fd_server_socket())
 
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("--channels", default="1-11")
@@ -414,6 +478,13 @@ def main(argv: Sequence[str]) -> int:
     usb_fd = int(getattr(args, "usb_fd", -1))
     want_vid = getattr(args, "vid", None)
     want_pid = getattr(args, "pid", None)
+    fd_from_server: Optional[int] = None
+    if usb_fd < 0 and _is_termux():
+        sock_path = _default_fd_server_socket()
+        if sock_path and os.path.exists(sock_path):
+            fd_from_server = _recv_fd_from_unix_socket(sock_path)
+            if fd_from_server is not None and int(fd_from_server) >= 0:
+                usb_fd = int(fd_from_server)
 
     if args.cmd == "_termux-vidpid":
         if usb_fd < 0:
@@ -421,6 +492,48 @@ def main(argv: Sequence[str]) -> int:
         v, p = _detect_vid_pid_from_usb_fd(usb_fd)
         sys.stdout.write(f"{v:04x}:{p:04x}\n")
         return 0
+
+    if args.cmd == "fd-server":
+        if usb_fd < 0:
+            raise RuntimeError("missing usb fd (run via termux-usb -e ... <device>)")
+        sock_path = str(getattr(args, "socket", "") or "").strip() or _default_fd_server_socket()
+        try:
+            os.unlink(sock_path)
+        except Exception:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(sock_path)
+        srv.listen(1)
+        try:
+            while True:
+                conn, _addr = srv.accept()
+                try:
+                    try:
+                        conn.recv(128)
+                    except Exception:
+                        pass
+                    fd_dup = os.dup(int(usb_fd))
+                    payload = b"OK\n"
+                    anc = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd_dup]).tobytes())]
+                    conn.sendmsg([payload], anc)
+                    try:
+                        os.close(fd_dup)
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                srv.close()
+            except Exception:
+                pass
+            try:
+                os.unlink(sock_path)
+            except Exception:
+                pass
 
     if args.cmd == "list":
         if _has_termux_usb():
@@ -737,7 +850,11 @@ def main(argv: Sequence[str]) -> int:
             except Exception:
                 termux_dev = None
 
-    return _exec_backend(prog_abs, [*fwd, *cmd_argv], termux_device_path=termux_dev)
+    usb_fd_to_pass: Optional[int] = None
+    if termux_dev is None and usb_fd >= 0 and (_is_termux() or fd_from_server is not None):
+        usb_fd_to_pass = int(usb_fd)
+
+    return _exec_backend(prog_abs, [*fwd, *cmd_argv], termux_device_path=termux_dev, usb_fd_to_pass=usb_fd_to_pass)
 
 
 if __name__ == "__main__":
