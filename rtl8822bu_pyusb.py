@@ -1418,6 +1418,7 @@ def main(argv: list[str]) -> int:
     p_scan.add_argument("--read-size", type=int, default=32768, dest="read_size")
     p_scan.add_argument("--size", type=int, default=32768, dest="read_size")
     p_scan.add_argument("--target-ssid", default="")
+    p_scan.add_argument("--forever", action="store_true")
     p_scan.add_argument("--scan-include-bad-fcs", action="store_true")
     p_scan.add_argument("--station-scan-ms", type=int, default=5000)
     p_scan.add_argument("--scan-strict-ds-channel", action="store_true")
@@ -1788,9 +1789,7 @@ def main(argv: list[str]) -> int:
                     fp = sys.stdout.buffer if p == "-" else open(p, "wb")
                     pcap = PcapWriter(fp)
 
-                scan_iter = channels
-                if not target_ssid and not sys.stdout.isatty():
-                    scan_iter = itertools.cycle(channels)
+                scan_iter = itertools.cycle(channels) if bool(args.forever) else channels
 
                 for ch in scan_iter:
                     dev.set_channel(int(ch), bandwidth_mhz=int(args.bw))

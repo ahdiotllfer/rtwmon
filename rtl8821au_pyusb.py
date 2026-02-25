@@ -2338,6 +2338,7 @@ def main(argv: list[str]) -> int:
     p_scan.add_argument("--size", type=int, default=32768)
     p_scan.add_argument("--timeout-ms", type=int, default=1200)
     p_scan.add_argument("--target-ssid", default="")
+    p_scan.add_argument("--forever", action="store_true")
     p_scan.add_argument("--scan-include-bad-fcs", action="store_true")
     p_scan.add_argument("--station-scan-ms", type=int, default=5000)
     p_scan.add_argument("--replay-pcap", default="mon-mode.pcap")
@@ -2912,9 +2913,7 @@ def main(argv: list[str]) -> int:
             total_bcn = 0
             total_prb = 0
             dumped = 0
-            scan_iter = channels
-            if not args.target_ssid and not sys.stdout.isatty():
-                scan_iter = itertools.cycle(channels)
+            scan_iter = itertools.cycle(channels) if bool(args.forever) else channels
             for ch in scan_iter:
                 try:
                     dev.set_channel(ch, bandwidth_mhz=args.bw)

@@ -2066,6 +2066,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--init-only", action="store_true")
     parser.add_argument("--rx", action="store_true")
     parser.add_argument("--scan", action="store_true")
+    parser.add_argument("--forever", action="store_true")
     parser.add_argument("--target-ssid", type=str, default="")
     parser.add_argument("--scan-include-bad-fcs", action="store_true")
     parser.add_argument("--pcap", type=str, default="")
@@ -2236,7 +2237,7 @@ def main(argv: Sequence[str]) -> int:
                     )
                 sys.stdout.flush()
 
-            forever = (not bool(args.target_ssid)) and (not sys.stdout.isatty())
+            forever = bool(args.forever)
             results = chip.scan_passive(
                 channels=channels,
                 dwell_ms=args.dwell_ms,
