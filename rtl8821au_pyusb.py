@@ -2913,6 +2913,7 @@ def main(argv: list[str]) -> int:
             total_bcn = 0
             total_prb = 0
             dumped = 0
+            include_bad = bool(args.scan_include_bad_fcs) or int(getattr(args, "usb_fd", -1)) >= 0
             scan_iter = itertools.cycle(channels) if bool(args.forever) else channels
             for ch in scan_iter:
                 try:
@@ -2947,7 +2948,7 @@ def main(argv: list[str]) -> int:
                         ch_bytes += len(raw)
                         for pkt in parse_rx_agg(raw):
                             ch_pkts += 1
-                            if not args.scan_include_bad_fcs and (pkt.crc_err or pkt.icv_err):
+                            if not include_bad and (pkt.crc_err or pkt.icv_err):
                                 continue
                             frame = pkt.frame
                             if not frame or _fc_version(frame) != 0:

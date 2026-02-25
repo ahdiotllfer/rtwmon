@@ -1760,6 +1760,7 @@ def main(argv: list[str]) -> int:
                 ep_in = int(dev.bulk_in_eps[0].bEndpointAddress)
 
             target_ssid = str(getattr(args, "target_ssid", "")).strip()
+            include_bad = bool(args.scan_include_bad_fcs) or int(getattr(args, "usb_fd", -1)) >= 0
 
             def _best_channel(counts: object) -> int:
                 if not isinstance(counts, dict) or not counts:
@@ -1810,7 +1811,7 @@ def main(argv: list[str]) -> int:
                             frame = pkt.frame
                             if _fc_version(frame) != 0:
                                 continue
-                            if not bool(args.scan_include_bad_fcs) and (pkt.crc_err or pkt.icv_err):
+                            if not include_bad and (pkt.crc_err or pkt.icv_err):
                                 continue
                             if len(frame) < 2:
                                 continue
