@@ -3,7 +3,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -124,18 +123,18 @@ def _autodetect_driver(
             raise RuntimeError(f"Unsupported USB device via fd: {v:04x}:{p:04x}")
         return drv, (v, p)
 
-    if _has_termux_usb() and (bus is None or int(bus) < 0) and (address is None or int(address) < 0):
+    if _has_termux_api_usb() and (bus is None or int(bus) < 0) and (address is None or int(address) < 0):
         drv, v, p, _b, _a, _path = _termux_select_supported_device()
         return drv, (v, p)
 
-    if _has_termux_usb() and bus is not None and address is not None and int(bus) >= 0 and int(address) >= 0:
+    if _has_termux_api_usb() and bus is not None and address is not None and int(bus) >= 0 and int(address) >= 0:
         path = _termux_usb_device_path(int(bus), int(address))
         vpid = _termux_vid_pid_for_device_path(path)
         if vpid is not None:
             v, p = vpid
             drv = _pick_driver(v, p)
             if drv is None:
-                raise RuntimeError(f"Unsupported USB device via termux-usb: {v:04x}:{p:04x}")
+                raise RuntimeError(f"Unsupported USB device via termux-api: {v:04x}:{p:04x}")
             return drv, (v, p)
 
     if vid is not None and pid is not None:
@@ -233,10 +232,6 @@ def _script_path(name: str) -> str:
     return str(p)
 
 
-def _has_termux_usb() -> bool:
-    return shutil.which("termux-usb") is not None
-
-
 def _termux_api_bin() -> Optional[str]:
     p = "/data/data/com.termux/files/usr/libexec/termux-api"
     try:
@@ -252,38 +247,19 @@ def _has_termux_api_usb() -> bool:
 
 
 def _termux_usb_list_paths() -> List[str]:
-    if _has_termux_api_usb():
-        try:
-            out = subprocess.check_output([_termux_api_bin(), "Usb", "-a", "list"], stderr=subprocess.DEVNULL, text=True)
-            s = out.strip()
-            if not s:
-                return []
-            v = json.loads(s)
-            if isinstance(v, list):
-                return [str(x) for x in v if isinstance(x, str)]
-        except Exception:
+    if not _has_termux_api_usb():
+        return []
+    try:
+        out = subprocess.check_output([_termux_api_bin(), "Usb", "-a", "list"], stderr=subprocess.DEVNULL, text=True)
+        s = out.strip()
+        if not s:
             return []
-    try:
-        out = subprocess.check_output(["termux-usb", "-l"], stderr=subprocess.DEVNULL, text=True)
-    except Exception:
-        return []
-    s = out.strip()
-    if not s:
-        return []
-    try:
         v = json.loads(s)
         if isinstance(v, list):
             return [str(x) for x in v if isinstance(x, str)]
     except Exception:
-        pass
-    paths = []
-    for line in s.splitlines():
-        line = line.strip().strip(",")
-        if "/dev/bus/usb/" in line:
-            m = re.search(r"(/dev/bus/usb/\d+/\d+)", line)
-            if m:
-                paths.append(m.group(1))
-    return paths
+        return []
+    return []
 
 
 def _termux_usb_device_path(bus: int, address: int) -> str:
@@ -302,12 +278,6 @@ def _termux_usb_permission_request(device_path: str) -> bool:
             return out == "yes" or "Permission granted" in out
         except Exception:
             return False
-    if _has_termux_usb():
-        try:
-            out = subprocess.check_output(["termux-usb", "-r", device_path], stderr=subprocess.STDOUT, text=True).strip()
-            return "granted" in out.lower() or out == "yes"
-        except Exception:
-            return False
     return False
 
 
@@ -319,15 +289,12 @@ def _termux_usb_open_exec(device_path: str, cmd: Sequence[str]) -> int:
             return 1
         env = dict(os.environ)
         env["TERMUX_CALLBACK"] = cmd_str
-        env["TERMUX_EXPORT_FD"] = "true"
         return int(
             subprocess.run(
                 [_termux_api_bin(), "Usb", "-a", "open", "--es", "device", device_path],
                 env=env,
             ).returncode
         )
-    if _has_termux_usb():
-        return int(subprocess.run(["termux-usb", "-r", "-e", cmd_str, device_path]).returncode)
     return int(subprocess.run(list(cmd)).returncode)
 
 
@@ -339,7 +306,6 @@ def _termux_usb_open_capture(device_path: str, cmd: Sequence[str]) -> Optional[s
             return None
         env = dict(os.environ)
         env["TERMUX_CALLBACK"] = cmd_str
-        env["TERMUX_EXPORT_FD"] = "true"
         try:
             return subprocess.check_output(
                 [_termux_api_bin(), "Usb", "-a", "open", "--es", "device", device_path],
@@ -347,11 +313,6 @@ def _termux_usb_open_capture(device_path: str, cmd: Sequence[str]) -> Optional[s
                 text=True,
                 env=env,
             )
-        except Exception:
-            return None
-    if _has_termux_usb():
-        try:
-            return subprocess.check_output(["termux-usb", "-r", "-e", cmd_str, device_path], stderr=subprocess.STDOUT, text=True)
         except Exception:
             return None
     return None
@@ -401,7 +362,7 @@ def _termux_select_supported_device() -> Tuple[str, int, int, int, int, str]:
         raise RuntimeError(
             "Multiple supported adapters detected via termux: " + ", ".join(parts) + ". Use --bus/--address."
         )
-    raise RuntimeError("No supported Realtek USB adapter found via termux (check termux-usb -l)")
+    raise RuntimeError("No supported Realtek USB adapter found via termux (check termux-api Usb -a list)")
 
 
 def _exec_backend(prog: str, argv: Sequence[str], *, termux_device_path: Optional[str] = None) -> int:
@@ -410,7 +371,7 @@ def _exec_backend(prog: str, argv: Sequence[str], *, termux_device_path: Optiona
         cmd = [py, "-u", prog, *argv]
     else:
         cmd = [prog, *argv]
-    if termux_device_path and (_has_termux_api_usb() or _has_termux_usb()):
+    if termux_device_path and _has_termux_api_usb():
         r = _termux_usb_open_exec(str(termux_device_path), cmd)
     else:
         r = subprocess.run(cmd).returncode
@@ -512,7 +473,7 @@ def main(argv: Sequence[str]) -> int:
         return 0
 
     if args.cmd == "list":
-        if _has_termux_usb():
+        if _has_termux_api_usb():
             paths = _termux_usb_list_paths()
             for device_path in paths:
                 m = re.search(r"/dev/bus/usb/([0-9]+)/([0-9]+)", device_path)
@@ -814,7 +775,7 @@ def main(argv: Sequence[str]) -> int:
         cmd_argv += list(extra)
 
     termux_dev: Optional[str] = None
-    if _has_termux_usb() and usb_fd < 0:
+    if _has_termux_api_usb() and usb_fd < 0:
         bus = int(getattr(args, "bus", -1))
         addr = int(getattr(args, "address", -1))
         if bus >= 0 and addr >= 0:
