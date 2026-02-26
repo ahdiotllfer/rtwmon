@@ -151,14 +151,18 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--pid", type=lambda s: int(s, 0), default=-1)
     ap.add_argument("--auto", action="store_true")
     ap.add_argument("--print-fd", action="store_true")
+    ap.add_argument("--multi-json", default="")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
 
-    cmd = list(args.cmd)
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
-    if not cmd:
-        raise SystemExit("missing command (use -- <command...>)")
+    multi_spec = str(getattr(args, "multi_json", "") or "").strip()
+    cmd: list[str] = []
+    if not multi_spec:
+        cmd = list(args.cmd)
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        if not cmd:
+            raise SystemExit("missing command (use -- <command...>)")
 
     device = str(args.device or "").strip()
     vid = int(getattr(args, "vid", -1))
@@ -193,7 +197,12 @@ def main(argv: list[str]) -> int:
     env["TERMUX_CALLBACK"] = _callback_cmd()
     env["TERMUX_EXPORT_FD"] = "true"
     env["RTWMON_MODE"] = ""
-    env["RTWMON_EXEC_JSON"] = json.dumps([str(x) for x in cmd])
+    if multi_spec:
+        env["RTWMON_EXEC_MULTI_JSON"] = str(multi_spec)
+        env.pop("RTWMON_EXEC_JSON", None)
+    else:
+        env.pop("RTWMON_EXEC_MULTI_JSON", None)
+        env["RTWMON_EXEC_JSON"] = json.dumps([str(x) for x in cmd])
 
     if args.print_fd:
         out = _termux_open_capture(device_path=chosen_device, vid=(chosen_vidpid[0] if chosen_vidpid else None), pid=(chosen_vidpid[1] if chosen_vidpid else None), env=env)
@@ -205,4 +214,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import subprocess
 import sys
 from typing import Any, Optional, Tuple
 
@@ -105,6 +106,21 @@ def _read_cmd() -> list[str]:
     return [str(x) for x in v]
 
 
+def _read_multi_cmds() -> list[list[str]]:
+    spec = os.environ.get("RTWMON_EXEC_MULTI_JSON", "")
+    if not spec:
+        return []
+    v = json.loads(spec)
+    if not isinstance(v, list) or not v:
+        raise RuntimeError("invalid RTWMON_EXEC_MULTI_JSON")
+    cmds: list[list[str]] = []
+    for item in v:
+        if not isinstance(item, list) or not item or not all(isinstance(x, str) for x in item):
+            raise RuntimeError("invalid RTWMON_EXEC_MULTI_JSON")
+        cmds.append([str(x) for x in item])
+    return cmds
+
+
 def main() -> int:
     usb_fd = _read_usb_fd()
     mode = str(os.environ.get("RTWMON_MODE", "") or "")
@@ -115,15 +131,33 @@ def main() -> int:
         sys.stdout.flush()
         return 0
 
-    cmd = _read_cmd()
     fd_s = str(int(usb_fd))
-    cmd = [fd_s if x == "{USB_FD}" else x for x in cmd]
     env = dict(os.environ)
     env["RTWMON_TERMUX_USB_FD"] = fd_s
+
+    try:
+        os.set_inheritable(int(usb_fd), True)
+    except Exception:
+        pass
+
+    cmds = _read_multi_cmds()
+    if cmds:
+        procs: list[subprocess.Popen] = []
+        for cmd in cmds:
+            argv = [fd_s if x == "{USB_FD}" else x for x in cmd]
+            procs.append(subprocess.Popen(argv, env=env))
+        exit_code = 0
+        for p in procs:
+            rc = int(p.wait())
+            if rc != 0 and exit_code == 0:
+                exit_code = rc
+        return exit_code
+
+    cmd = _read_cmd()
+    cmd = [fd_s if x == "{USB_FD}" else x for x in cmd]
     os.execvpe(cmd[0], cmd, env)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

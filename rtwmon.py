@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import shlex
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, List
 
@@ -23,8 +24,6 @@ SUPPORTED = {
         "py": "rtl8822bu_pyusb.py",
     },
 }
-
-
 def _libusb_error_name(lib, code: int) -> str:
     try:
         f = getattr(lib, "libusb_error_name", None)
@@ -491,6 +490,11 @@ def main(argv: Sequence[str]) -> int:
     sub.add_parser("list", help="List detected compatible devices")
     sub.add_parser("_termux-vidpid")
 
+    p_tm = sub.add_parser("termux-multi")
+    p_tm.add_argument("--device", default="")
+    p_tm.add_argument("--auto", action="store_true")
+    p_tm.add_argument("cmd", nargs=argparse.REMAINDER)
+
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("--channels", default="1-11")
     p_scan.add_argument("--bw", type=int, choices=(20, 40, 80), default=20)
@@ -561,6 +565,41 @@ def main(argv: Sequence[str]) -> int:
     usb_fd = int(getattr(args, "usb_fd", -1))
     want_vid = getattr(args, "vid", None)
     want_pid = getattr(args, "pid", None)
+
+    if args.cmd == "termux-multi":
+        cmd = list(getattr(args, "cmd", []) or [])
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        parts: list[list[str]] = []
+        cur: list[str] = []
+        for tok in cmd:
+            if tok == "--and":
+                if cur:
+                    parts.append(cur)
+                cur = []
+                continue
+            cur.append(tok)
+        if cur:
+            parts.append(cur)
+        if not parts:
+            raise RuntimeError("missing commands (use: termux-multi -- <cmd1...> --and <cmd2...>)")
+
+        device = str(getattr(args, "device", "") or "").strip()
+        if not device:
+            bus = int(getattr(args, "bus", -1))
+            addr = int(getattr(args, "address", -1))
+            if bus >= 0 and addr >= 0:
+                device = _termux_usb_device_path(bus, addr)
+        if not device:
+            raise RuntimeError("missing --device or --bus/--address")
+
+        py = os.environ.get("PYTHON", "python3")
+        runner = str((Path(__file__).resolve().parent / "termux_usb_run.py").resolve())
+        multi_json = json.dumps(parts)
+        run_cmd = [py, runner, "--device", device, "--multi-json", multi_json]
+        if bool(getattr(args, "auto", False)):
+            run_cmd.append("--auto")
+        return int(subprocess.run(run_cmd).returncode)
 
     if args.cmd == "_termux-vidpid":
         if usb_fd < 0:
