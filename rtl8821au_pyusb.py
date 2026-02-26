@@ -2936,7 +2936,7 @@ def main(argv: list[str]) -> int:
             total_bcn = 0
             total_prb = 0
             dumped = 0
-            include_bad = bool(args.scan_include_bad_fcs) or int(getattr(args, "usb_fd", -1)) >= 0
+            include_bad = bool(args.scan_include_bad_fcs)
             scan_iter = itertools.cycle(channels) if bool(args.forever) else channels
             for ch in scan_iter:
                 try:

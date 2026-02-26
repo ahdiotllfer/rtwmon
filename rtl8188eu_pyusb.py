@@ -2256,7 +2256,10 @@ def main(argv: Sequence[str]) -> int:
                 sys.stdout.flush()
 
             forever = bool(args.forever)
-            include_bad = bool(args.scan_include_bad_fcs) or int(getattr(args, "usb_fd", -1)) >= 0
+            if not str(getattr(args, "target_ssid", "") or "").strip():
+                args.forever = True
+                forever = True
+            include_bad = bool(args.scan_include_bad_fcs)
             results = chip.scan_passive(
                 channels=channels,
                 dwell_ms=args.dwell_ms,
@@ -2287,7 +2290,7 @@ def main(argv: Sequence[str]) -> int:
                             read_size=args.read_size,
                             timeout_ms=args.timeout_ms,
                             good_fcs_only=args.good_fcs_only,
-                            include_bad_fcs=True,
+                            include_bad_fcs=bool(args.scan_include_bad_fcs),
                         )
                         for sta in stations.values():
                             sys.stdout.write(f"  Station: {sta['mac']} seen={sta['seen']}\n")
