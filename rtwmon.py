@@ -401,6 +401,7 @@ def _exec_backend(
     *,
     termux_device_path: Optional[str] = None,
     termux_vid_pid: Optional[Tuple[int, int]] = None,
+    pass_usb_fd: Optional[int] = None,
 ) -> int:
     if str(prog).endswith(".py"):
         py = os.environ.get("PYTHON", "python3")
@@ -413,7 +414,10 @@ def _exec_backend(
         v, p = termux_vid_pid
         r = _termux_usb_open_exec(vid=int(v), pid=int(p), cmd=cmd)
     else:
-        r = subprocess.run(cmd).returncode
+        run_kwargs = {}
+        if pass_usb_fd is not None and int(pass_usb_fd) >= 0 and os.name == "posix":
+            run_kwargs["pass_fds"] = (int(pass_usb_fd),)
+        r = subprocess.run(cmd, **run_kwargs).returncode
     return int(r)
 
 
@@ -881,7 +885,13 @@ def main(argv: Sequence[str]) -> int:
             except Exception:
                 termux_dev = None
 
-    return _exec_backend(prog_abs, [*fwd, *cmd_argv], termux_device_path=termux_dev, termux_vid_pid=termux_vid_pid)
+    return _exec_backend(
+        prog_abs,
+        [*fwd, *cmd_argv],
+        termux_device_path=termux_dev,
+        termux_vid_pid=termux_vid_pid,
+        pass_usb_fd=(usb_fd if usb_fd >= 0 else None),
+    )
 
 
 if __name__ == "__main__":
