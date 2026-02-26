@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any, Optional, Tuple
 
 
@@ -129,6 +130,28 @@ def main() -> int:
         v, p = _detect_vid_pid_from_usb_fd(int(usb_fd))
         sys.stdout.write(f"{v:04x}:{p:04x}\n")
         sys.stdout.flush()
+        return 0
+    if mode == "daemon":
+        try:
+            pid = os.fork()
+        except Exception:
+            pid = 0
+        if pid > 0:
+            sys.stdout.write(f"daemon_pid={pid}\n")
+            sys.stdout.flush()
+            return 0
+        try:
+            os.setsid()
+        except Exception:
+            pass
+        sock = str(os.environ.get("RTWMON_DAEMON_SOCK", "") or "").strip()
+        if not sock:
+            sock = "/data/data/com.termux/files/usr/tmp/rtwmon-usb.sock"
+        py = os.environ.get("PYTHON", "python3")
+        daemon_py = str((Path(__file__).resolve().parent / "termux_usb_daemon.py").resolve())
+        env = dict(os.environ)
+        env["RTWMON_TERMUX_USB_FD"] = str(int(usb_fd))
+        os.execvpe(py, [py, daemon_py, "--sock", sock], env)
         return 0
 
     fd_s = str(int(usb_fd))

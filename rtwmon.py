@@ -5,6 +5,8 @@ import re
 import subprocess
 import sys
 import shlex
+import socket
+import struct
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, List
 
@@ -420,6 +422,33 @@ def _exec_backend(
     return int(r)
 
 
+def _termux_daemon_get_fd(sock_path: str) -> int:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(sock_path))
+        s.sendall(b'{"method":"get_fd"}\n')
+        data, anc, _flags, _addr = s.recvmsg(65536, socket.CMSG_SPACE(struct.calcsize("i")))
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    fd: Optional[int] = None
+    for level, ctype, cdata in anc:
+        if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS and len(cdata) >= struct.calcsize("i"):
+            fd = int(struct.unpack("i", cdata[: struct.calcsize("i")])[0])
+            break
+    if fd is None:
+        raise RuntimeError("daemon did not provide a fd")
+    try:
+        obj = json.loads(data.split(b"\n", 1)[0].decode("utf-8", errors="replace"))
+    except Exception:
+        obj = {}
+    if isinstance(obj, dict) and obj.get("ok", True) is False:
+        raise RuntimeError(str(obj.get("error", "daemon error")))
+    return int(fd)
+
+
 def main(argv: Sequence[str]) -> int:
     argv = list(argv)
     usb_fd_flag_val: Optional[str] = None
@@ -482,6 +511,7 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--interface", type=int, default=0)
     ap.add_argument("--configuration", type=int, default=1)
     ap.add_argument("--tables-from", type=str, default="")
+    ap.add_argument("--termux-daemon-sock", type=str, default=str(os.environ.get("RTWMON_TERMUX_DAEMON_SOCK", "") or ""))
     ap.add_argument("--debug", action="store_true")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -489,6 +519,11 @@ def main(argv: Sequence[str]) -> int:
     sub.add_parser("info")
     sub.add_parser("list", help="List detected compatible devices")
     sub.add_parser("_termux-vidpid")
+
+    p_td = sub.add_parser("termux-daemon")
+    p_td.add_argument("--device", default="")
+    p_td.add_argument("--sock", default=str(os.environ.get("RTWMON_TERMUX_DAEMON_SOCK", "") or ""))
+    p_td.add_argument("--auto", action="store_true")
 
     p_tm = sub.add_parser("termux-multi")
     p_tm.add_argument("--device", default="")
@@ -565,6 +600,25 @@ def main(argv: Sequence[str]) -> int:
     usb_fd = int(getattr(args, "usb_fd", -1))
     want_vid = getattr(args, "vid", None)
     want_pid = getattr(args, "pid", None)
+
+    if args.cmd == "termux-daemon":
+        device = str(getattr(args, "device", "") or "").strip()
+        if not device:
+            bus = int(getattr(args, "bus", -1))
+            addr = int(getattr(args, "address", -1))
+            if bus >= 0 and addr >= 0:
+                device = _termux_usb_device_path(bus, addr)
+        if not device:
+            raise RuntimeError("missing --device or --bus/--address")
+        sock_path = str(getattr(args, "sock", "") or "").strip()
+        if not sock_path:
+            sock_path = "/data/data/com.termux/files/usr/tmp/rtwmon-usb.sock"
+        py = os.environ.get("PYTHON", "python3")
+        runner = str((Path(__file__).resolve().parent / "termux_usb_run.py").resolve())
+        cmd = [py, runner, "--device", device, "--daemon", "--sock", sock_path]
+        if bool(getattr(args, "auto", False)):
+            cmd.append("--auto")
+        return int(subprocess.run(cmd).returncode)
 
     if args.cmd == "termux-multi":
         cmd = list(getattr(args, "cmd", []) or [])
@@ -651,6 +705,11 @@ def main(argv: Sequence[str]) -> int:
             except Exception:
                 pass
         return 0
+
+    termux_daemon_sock = str(getattr(args, "termux_daemon_sock", "") or "").strip()
+    if usb_fd < 0 and termux_daemon_sock:
+        usb_fd = _termux_daemon_get_fd(termux_daemon_sock)
+        args.usb_fd = int(usb_fd)
 
     if str(getattr(args, "driver", "auto")) != "auto":
         driver = str(args.driver)

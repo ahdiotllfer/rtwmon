@@ -152,12 +152,14 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--auto", action="store_true")
     ap.add_argument("--print-fd", action="store_true")
     ap.add_argument("--multi-json", default="")
+    ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--sock", default="")
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args(argv)
 
     multi_spec = str(getattr(args, "multi_json", "") or "").strip()
     cmd: list[str] = []
-    if not multi_spec:
+    if not multi_spec and not bool(getattr(args, "daemon", False)):
         cmd = list(args.cmd)
         if cmd and cmd[0] == "--":
             cmd = cmd[1:]
@@ -196,11 +198,19 @@ def main(argv: list[str]) -> int:
     env = dict(os.environ)
     env["TERMUX_CALLBACK"] = _callback_cmd()
     env["TERMUX_EXPORT_FD"] = "true"
-    env["RTWMON_MODE"] = ""
-    if multi_spec:
+    if bool(getattr(args, "daemon", False)):
+        env["RTWMON_MODE"] = "daemon"
+        sock = str(getattr(args, "sock", "") or "").strip()
+        if sock:
+            env["RTWMON_DAEMON_SOCK"] = sock
+        env.pop("RTWMON_EXEC_MULTI_JSON", None)
+        env.pop("RTWMON_EXEC_JSON", None)
+    elif multi_spec:
+        env["RTWMON_MODE"] = ""
         env["RTWMON_EXEC_MULTI_JSON"] = str(multi_spec)
         env.pop("RTWMON_EXEC_JSON", None)
     else:
+        env["RTWMON_MODE"] = ""
         env.pop("RTWMON_EXEC_MULTI_JSON", None)
         env["RTWMON_EXEC_JSON"] = json.dumps([str(x) for x in cmd])
 
