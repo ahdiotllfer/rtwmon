@@ -60,7 +60,20 @@ def _open_device_from_usb_fd(usb_fd: int) -> usb.core.Device:
     import ctypes
     import usb.backend.libusb1 as libusb1
 
-    backend = libusb1.get_backend()
+    def _find_libusb1(name):
+        p = os.environ.get("LIBUSB_PATH")
+        if p:
+            return str(p)
+        termux = "/data/data/com.termux/files/usr/lib/libusb-1.0.so"
+        if os.path.isfile(termux):
+            return termux
+        if name:
+            return name
+        return None
+
+    backend = libusb1.get_backend(find_library=_find_libusb1)
+    if backend is None:
+        raise RuntimeError("libusb backend not available (install libusb)")
     lib = backend.lib
 
     wrap = getattr(lib, "libusb_wrap_sys_device", None)
