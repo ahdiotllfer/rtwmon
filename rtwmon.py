@@ -665,6 +665,7 @@ def main(argv: Sequence[str]) -> int:
     p_deauth.add_argument("--reason", type=int, default=7)
     p_deauth.add_argument("--count", type=int, default=1)
     p_deauth.add_argument("--delay-ms", type=int, default=100)
+    p_deauth.add_argument("--sock", default="")
 
     p_burst = sub.add_parser("deauth-burst")
     p_burst.add_argument("--channel", type=int, default=1)
@@ -829,6 +830,24 @@ def main(argv: Sequence[str]) -> int:
             except Exception:
                 pass
         return 0
+
+    if args.cmd == "deauth":
+        sock_path = str(getattr(args, "sock", "") or "").strip()
+        if sock_path:
+            rc = _ctl_call(sock_path, {"method": "set_channel", "channel": int(getattr(args, "channel", 1)), "bw": int(getattr(args, "bw", 20))})
+            if rc != 0:
+                return int(rc)
+            req = {
+                "method": "deauth",
+                "bssid": str(getattr(args, "bssid")),
+                "target_mac": str(getattr(args, "target_mac")),
+                "reason": int(getattr(args, "reason", 7)),
+                "count": int(getattr(args, "count", 1)),
+                "delay_ms": int(getattr(args, "delay_ms", 100)),
+            }
+            if getattr(args, "source_mac", None):
+                req["source_mac"] = str(getattr(args, "source_mac"))
+            return _ctl_call(sock_path, req)
 
     termux_daemon_sock = str(getattr(args, "termux_daemon_sock", "") or "").strip()
     use_termux_daemon = False
