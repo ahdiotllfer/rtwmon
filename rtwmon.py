@@ -290,7 +290,6 @@ def _termux_usb_permission_request(*, device_path: Optional[str] = None, vid: Op
 
 
 def _termux_usb_open_exec(*, device_path: Optional[str] = None, vid: Optional[int] = None, pid: Optional[int] = None, cmd: Sequence[str]) -> int:
-    cmd_str = " ".join(str(x) for x in list(cmd))
     if not _has_termux_api_usb():
         return int(subprocess.run(list(cmd)).returncode)
     extra: list[str] = []
@@ -303,14 +302,15 @@ def _termux_usb_open_exec(*, device_path: Optional[str] = None, vid: Optional[in
     if not _termux_usb_permission_request(device_path=device_path, vid=vid, pid=pid):
         return 1
     env = dict(os.environ)
-    env["TERMUX_CALLBACK"] = cmd_str
+    cb = str((Path(__file__).resolve().parent / "rtwmon_termux_callback.py").resolve())
+    env["TERMUX_CALLBACK"] = f"{os.environ.get('PYTHON', 'python3')} {cb}"
+    env["RTWMON_TERMUX_CALLBACK_JSON"] = json.dumps([str(x) for x in list(cmd)])
     return int(subprocess.run([_termux_api_bin(), "Usb", "-a", "open", *extra], env=env).returncode)
 
 
 def _termux_usb_open_capture(
     *, device_path: Optional[str] = None, vid: Optional[int] = None, pid: Optional[int] = None, cmd: Sequence[str]
 ) -> Optional[str]:
-    cmd_str = " ".join(str(x) for x in list(cmd))
     if not _has_termux_api_usb():
         return None
     extra: list[str] = []
@@ -323,7 +323,9 @@ def _termux_usb_open_capture(
     if not _termux_usb_permission_request(device_path=device_path, vid=vid, pid=pid):
         return None
     env = dict(os.environ)
-    env["TERMUX_CALLBACK"] = cmd_str
+    cb = str((Path(__file__).resolve().parent / "rtwmon_termux_callback.py").resolve())
+    env["TERMUX_CALLBACK"] = f"{os.environ.get('PYTHON', 'python3')} {cb}"
+    env["RTWMON_TERMUX_CALLBACK_JSON"] = json.dumps([str(x) for x in list(cmd)])
     try:
         return subprocess.check_output(
             [_termux_api_bin(), "Usb", "-a", "open", *extra],
