@@ -1411,6 +1411,7 @@ def main(argv: list[str]) -> int:
     p_rx.add_argument("--replay-sleep", action="store_true")
     p_rx.add_argument("--replay-max-sleep-ms", type=int, default=5)
     p_rx.add_argument("--replay-limit", type=int, default=0)
+    p_rx.add_argument("--replay-init-limit", type=int, default=2000)
     p_rx.add_argument("--replay-no-verify-in", action="store_true")
     p_rx.add_argument("--replay-verify-in-len", action="store_true")
     p_rx.add_argument("--replay-only-rtw-vendor-req", action="store_true")
@@ -1450,6 +1451,7 @@ def main(argv: list[str]) -> int:
     p_scan.add_argument("--replay-sleep", action="store_true")
     p_scan.add_argument("--replay-max-sleep-ms", type=int, default=5)
     p_scan.add_argument("--replay-limit", type=int, default=0)
+    p_scan.add_argument("--replay-init-limit", type=int, default=2000)
     p_scan.add_argument("--replay-no-verify-in", action="store_true")
     p_scan.add_argument("--replay-verify-in-len", action="store_true")
     p_scan.add_argument("--replay-only-rtw-vendor-req", action="store_true")
@@ -1538,6 +1540,7 @@ def main(argv: list[str]) -> int:
     p_deauth_burst.add_argument("--replay-sleep", action="store_true")
     p_deauth_burst.add_argument("--replay-max-sleep-ms", type=int, default=5)
     p_deauth_burst.add_argument("--replay-limit", type=int, default=0)
+    p_deauth_burst.add_argument("--replay-init-limit", type=int, default=2000)
     p_deauth_burst.add_argument("--replay-no-verify-in", action="store_true")
     p_deauth_burst.add_argument("--replay-verify-in-len", action="store_true")
     p_deauth_burst.add_argument("--replay-only-rtw-vendor-req", action="store_true")
@@ -1645,6 +1648,9 @@ def main(argv: list[str]) -> int:
             if str(getattr(args, "replay_mode", "all")) == "vendor":
                 default_filter = "usb.urb_type=='S' || usb.urb_type=='C'"
             display_filter = str(getattr(args, "replay_filter", None) or default_filter)
+            replay_limit = int(getattr(args, "replay_init_limit", 0))
+            if replay_limit <= 0:
+                replay_limit = int(getattr(args, "replay_limit", 0))
             stats = dev.replay_all_usb_requests_from_pcap(
                 replay_pcap,
                 display_filter=display_filter,
@@ -1659,7 +1665,7 @@ def main(argv: list[str]) -> int:
                 only_rtw_vendor_req=bool(args.replay_only_rtw_vendor_req) or (str(getattr(args, "replay_mode", "all")) == "vendor"),
                 report_mismatch=int(args.replay_report_mismatch),
                 report_errors=int(args.replay_report_errors),
-                limit=int(args.replay_limit),
+                limit=int(replay_limit),
             )
             if args.debug:
                 print(f"[replay] stats={stats}")
@@ -1754,6 +1760,9 @@ def main(argv: list[str]) -> int:
 
             default_filter = "usb.urb_type=='S' || usb.urb_type=='C'"
             display_filter = str(getattr(args, "replay_filter", None) or default_filter)
+            replay_limit = int(getattr(args, "replay_init_limit", 0))
+            if replay_limit <= 0:
+                replay_limit = int(getattr(args, "replay_limit", 0))
             stats = dev.replay_all_usb_requests_from_pcap(
                 replay_pcap,
                 display_filter=display_filter,
@@ -1768,7 +1777,7 @@ def main(argv: list[str]) -> int:
                 only_rtw_vendor_req=bool(args.replay_only_rtw_vendor_req),
                 report_mismatch=int(args.replay_report_mismatch),
                 report_errors=int(args.replay_report_errors),
-                limit=int(args.replay_limit),
+                limit=int(replay_limit),
             )
             if args.debug:
                 print(f"[replay] stats={stats}")
@@ -2169,6 +2178,9 @@ def main(argv: list[str]) -> int:
 
             default_filter = "usb.urb_type=='S' || usb.urb_type=='C'"
             display_filter = str(getattr(args, "replay_filter", None) or default_filter)
+            replay_limit = int(getattr(args, "replay_init_limit", 0))
+            if replay_limit <= 0:
+                replay_limit = int(getattr(args, "replay_limit", 0))
             stats = dev.replay_all_usb_requests_from_pcap(
                 replay_pcap,
                 display_filter=display_filter,
@@ -2183,7 +2195,7 @@ def main(argv: list[str]) -> int:
                 only_rtw_vendor_req=bool(args.replay_only_rtw_vendor_req) or (str(getattr(args, "replay_mode", "vendor")) == "vendor"),
                 report_mismatch=int(args.replay_report_mismatch),
                 report_errors=int(args.replay_report_errors),
-                limit=int(args.replay_limit),
+                limit=int(replay_limit),
             )
             if args.debug:
                 print(f"[replay] stats={stats}")

@@ -505,6 +505,7 @@ def main(argv: Sequence[str]) -> int:
     p_scan.add_argument("--pcap-include-bad-fcs", action="store_true")
     p_scan.add_argument("--pcap-with-fcs", action="store_true")
     p_scan.add_argument("--igi", type=int, default=-1)
+    p_scan.add_argument("--replay-init-limit", type=int, default=0)
 
     p_rx = sub.add_parser("rx")
     p_rx.add_argument("--channel", type=int, default=1)
@@ -516,6 +517,7 @@ def main(argv: Sequence[str]) -> int:
     p_rx.add_argument("--pcap-include-bad-fcs", action="store_true")
     p_rx.add_argument("--pcap-with-fcs", action="store_true")
     p_rx.add_argument("--igi", type=int, default=-1)
+    p_rx.add_argument("--replay-init-limit", type=int, default=0)
 
     p_deauth = sub.add_parser("deauth")
     p_deauth.add_argument("--channel", type=int, default=1)
@@ -544,6 +546,7 @@ def main(argv: Sequence[str]) -> int:
     p_burst.add_argument("--burst-read-timeout-ms", type=int, default=50)
     p_burst.add_argument("--read-size", type=int, default=32768)
     p_burst.add_argument("--size", type=int, default=32768, dest="read_size")
+    p_burst.add_argument("--replay-init-limit", type=int, default=0)
 
     args, extra = ap.parse_known_args(argv)
     if extra and len(extra) == 1 and extra[0] == argv[-1] and re.fullmatch(r"[0-9]+", extra[0]) is not None and int(getattr(args, "usb_fd", -1)) < 0:
@@ -732,6 +735,9 @@ def main(argv: Sequence[str]) -> int:
         igi = int(getattr(args, "igi", -1))
         if driver != "8188eu" and igi >= 0:
             cmd_argv += ["--igi", str(igi)]
+        replay_init_limit = int(getattr(args, "replay_init_limit", 0))
+        if driver in ("8821au", "8822bu") and replay_init_limit > 0:
+            cmd_argv += ["--replay-init-limit", str(replay_init_limit)]
     elif args.cmd == "rx":
         if driver == "8188eu":
             cmd_argv += [
@@ -766,6 +772,9 @@ def main(argv: Sequence[str]) -> int:
         igi = int(getattr(args, "igi", -1))
         if driver != "8188eu" and igi >= 0:
             cmd_argv += ["--igi", str(igi)]
+        replay_init_limit = int(getattr(args, "replay_init_limit", 0))
+        if driver in ("8821au", "8822bu") and replay_init_limit > 0:
+            cmd_argv += ["--replay-init-limit", str(replay_init_limit)]
     elif args.cmd == "deauth":
         if driver == "8188eu":
             cmd_argv += [
@@ -869,6 +878,9 @@ def main(argv: Sequence[str]) -> int:
             cmd_argv.append("--pcap-include-bad-fcs")
         if bool(getattr(args, "pcap_with_fcs", False)):
             cmd_argv.append("--pcap-with-fcs")
+        replay_init_limit = int(getattr(args, "replay_init_limit", 0))
+        if driver in ("8821au", "8822bu") and replay_init_limit > 0:
+            cmd_argv += ["--replay-init-limit", str(replay_init_limit)]
 
     if extra:
         cmd_argv += list(extra)
