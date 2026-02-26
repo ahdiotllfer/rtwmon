@@ -1,11 +1,14 @@
 import argparse
+import json
 import os
 import re
+import socket
 import struct
 import sys
 import time
 import zlib
 import itertools
+import threading
 
 
 def _is_termux() -> bool:
@@ -775,6 +778,7 @@ class RTL8188EU:
         self.dev = dev
         self.tables = tables
         self.fops = Fops8188E()
+        self.io_lock = threading.Lock()
 
         self.cfg = None
         self.intf = None
@@ -1375,7 +1379,8 @@ class RTL8188EU:
         reads = 0
         while max_reads is None or reads < max_reads:
             try:
-                data = self.dev.read(self.ep_in, read_size, timeout=timeout_ms)
+                with self.io_lock:
+                    data = self.dev.read(self.ep_in, read_size, timeout=timeout_ms)
             except Exception:
                 continue
             reads += 1
@@ -1760,7 +1765,8 @@ class RTL8188EU:
         r_s = "OK"
         ok = True
         try:
-            wrote = self.dev.write(ep, data, timeout=timeout)
+            with self.io_lock:
+                wrote = self.dev.write(ep, data, timeout=timeout)
         except Exception as e:
             wrote = 0
             r_s = repr(e)
@@ -2104,6 +2110,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--timeout-ms", type=int, default=1000)
     parser.add_argument("--good-fcs-only", action="store_true")
     parser.add_argument("--dump-bytes", type=int, default=0)
+    parser.add_argument("--control-sock", type=str, default="")
     parser.add_argument("--disassoc", action="store_true", help="Send Disassociate frame")
     parser.add_argument("--deauth", action="store_true", help="Send Deauthentication frame")
     parser.add_argument("--deauth-burst", action="store_true", help="Send deauth bursts and capture to pcap")
@@ -2173,6 +2180,117 @@ def main(argv: Sequence[str]) -> int:
         chip.tx_dump_bytes = int(args.tx_dump_bytes)
         chip.tx_timeout_ms = int(args.tx_timeout_ms)
 
+        ctrl_sock = str(getattr(args, "control_sock", "") or "").strip()
+        ctrl_stop = threading.Event()
+        ctrl_srv = None
+
+        def _ctrl_send(conn, obj: dict) -> None:
+            try:
+                conn.sendall((json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        def _ctrl_loop() -> None:
+            nonlocal ctrl_srv
+            if not ctrl_sock:
+                return
+            try:
+                try:
+                    if os.path.exists(ctrl_sock):
+                        os.unlink(ctrl_sock)
+                except Exception:
+                    pass
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                ctrl_srv = srv
+                srv.bind(ctrl_sock)
+                try:
+                    os.chmod(ctrl_sock, 0o600)
+                except Exception:
+                    pass
+                srv.listen(8)
+                srv.settimeout(0.2)
+            except Exception:
+                return
+
+            while not ctrl_stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+                try:
+                    conn.settimeout(1.0)
+                    buf = b""
+                    while b"\n" not in buf and len(buf) < 65536:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+                    try:
+                        req = json.loads(line) if line else {}
+                    except Exception:
+                        req = {}
+                    if not isinstance(req, dict):
+                        req = {}
+                    method = str(req.get("method", "") or "")
+
+                    if method == "ping":
+                        _ctrl_send(conn, {"ok": True, "result": {"pong": True}})
+                        continue
+                    if method == "stop":
+                        ctrl_stop.set()
+                        _ctrl_send(conn, {"ok": True, "result": {"stopping": True}})
+                        continue
+                    if method == "set_channel":
+                        ch = int(req.get("channel", 1) or 1)
+                        bw = int(req.get("bw", int(args.bw)) or int(args.bw))
+                        if bw not in (20, 40):
+                            bw = 20
+                        with chip.io_lock:
+                            chip.set_channel(int(ch), bw=int(bw))
+                        _ctrl_send(conn, {"ok": True, "result": {"channel": int(ch), "bw": int(bw)}})
+                        continue
+                    if method == "deauth":
+                        bssid = str(req.get("bssid", "") or "")
+                        dest = str(req.get("target_mac", "") or "")
+                        source = req.get("source_mac", None)
+                        source_s = str(source) if source is not None else None
+                        reason = int(req.get("reason", 7) or 7)
+                        count = int(req.get("count", 1) or 1)
+                        delay_ms = int(req.get("delay_ms", 0) or 0)
+                        sent = 0
+                        for i in range(max(0, count)):
+                            chip.send_deauth(dest=dest, bssid=bssid, source=source_s, reason=reason)
+                            sent += 1
+                            if delay_ms > 0 and i + 1 < count:
+                                time.sleep(float(delay_ms) / 1000.0)
+                        _ctrl_send(conn, {"ok": True, "result": {"sent": int(sent)}})
+                        continue
+
+                    _ctrl_send(conn, {"ok": False, "error": "unknown method"})
+                except Exception as e:
+                    try:
+                        _ctrl_send(conn, {"ok": False, "error": str(e)})
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+            try:
+                srv.close()
+            except Exception:
+                pass
+            try:
+                if ctrl_sock and os.path.exists(ctrl_sock):
+                    os.unlink(ctrl_sock)
+            except Exception:
+                pass
+
         if args.debug:
             intf_num = chip.intf.bInterfaceNumber if chip.intf is not None else -1
             ep_in = chip.ep_in if chip.ep_in is not None else 0
@@ -2219,7 +2337,10 @@ def main(argv: Sequence[str]) -> int:
 
             sys.stdout.write(f"deauth_burst: sent={sent} pcap_written={written}\n")
             return 0
-        if args.pcap:
+        if ctrl_sock:
+            threading.Thread(target=_ctrl_loop, daemon=True).start()
+
+        if args.pcap and not args.rx:
             max_reads = None if args.reads == 0 else args.reads
             fp = sys.stdout.buffer if args.pcap == "-" else open(args.pcap, "wb")
             try:
@@ -2339,15 +2460,47 @@ def main(argv: Sequence[str]) -> int:
             return 0
         if args.rx:
             max_reads = None if args.reads == 0 else args.reads
-            chip.rx_loop(
-                max_reads=max_reads,
-                read_size=args.read_size,
-                timeout_ms=args.timeout_ms,
-                good_fcs_only=args.good_fcs_only,
-                dump_bytes=args.dump_bytes,
-            )
+            if args.pcap:
+                fp = sys.stdout.buffer if args.pcap == "-" else open(args.pcap, "wb")
+                try:
+                    pcap = PcapWriter(fp)
+                    try:
+                        chip.capture_pcap(
+                            pcap=pcap,
+                            max_reads=max_reads,
+                            read_size=args.read_size,
+                            timeout_ms=args.timeout_ms,
+                            include_bad_fcs=args.pcap_include_bad_fcs,
+                            keep_fcs=args.pcap_with_fcs,
+                        )
+                    except KeyboardInterrupt:
+                        pass
+                    pcap.flush()
+                finally:
+                    if args.pcap != "-":
+                        fp.close()
+            else:
+                chip.rx_loop(
+                    max_reads=max_reads,
+                    read_size=args.read_size,
+                    timeout_ms=args.timeout_ms,
+                    good_fcs_only=args.good_fcs_only,
+                    dump_bytes=args.dump_bytes,
+                )
         return 0
     finally:
+        ctrl_stop.set()
+        if ctrl_srv is not None:
+            try:
+                ctrl_srv.close()
+            except Exception:
+                pass
+        if ctrl_sock:
+            try:
+                if os.path.exists(ctrl_sock):
+                    os.unlink(ctrl_sock)
+            except Exception:
+                pass
         chip.close()
 
 
