@@ -505,7 +505,7 @@ def main(argv: Sequence[str]) -> int:
     p_scan.add_argument("--pcap-include-bad-fcs", action="store_true")
     p_scan.add_argument("--pcap-with-fcs", action="store_true")
     p_scan.add_argument("--igi", type=int, default=-1)
-    p_scan.add_argument("--replay-init-limit", type=int, default=0)
+    p_scan.add_argument("--replay-init-limit", type=int, default=14500)
 
     p_rx = sub.add_parser("rx")
     p_rx.add_argument("--channel", type=int, default=1)
@@ -517,7 +517,7 @@ def main(argv: Sequence[str]) -> int:
     p_rx.add_argument("--pcap-include-bad-fcs", action="store_true")
     p_rx.add_argument("--pcap-with-fcs", action="store_true")
     p_rx.add_argument("--igi", type=int, default=-1)
-    p_rx.add_argument("--replay-init-limit", type=int, default=0)
+    p_rx.add_argument("--replay-init-limit", type=int, default=14500)
 
     p_deauth = sub.add_parser("deauth")
     p_deauth.add_argument("--channel", type=int, default=1)
@@ -546,7 +546,7 @@ def main(argv: Sequence[str]) -> int:
     p_burst.add_argument("--burst-read-timeout-ms", type=int, default=50)
     p_burst.add_argument("--read-size", type=int, default=32768)
     p_burst.add_argument("--size", type=int, default=32768, dest="read_size")
-    p_burst.add_argument("--replay-init-limit", type=int, default=0)
+    p_burst.add_argument("--replay-init-limit", type=int, default=14500)
 
     args, extra = ap.parse_known_args(argv)
     if extra and len(extra) == 1 and extra[0] == argv[-1] and re.fullmatch(r"[0-9]+", extra[0]) is not None and int(getattr(args, "usb_fd", -1)) < 0:

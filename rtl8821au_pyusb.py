@@ -2341,11 +2341,11 @@ def main(argv: list[str]) -> int:
     p_rx.add_argument("--replay-mode", choices=("vendor", "all"), default="all")
     p_rx.add_argument("--replay-only", action="store_true")
     p_rx.add_argument("--replay-sleep", action="store_true")
-    p_rx.add_argument("--replay-max-sleep-ms", type=int, default=5)
+    p_rx.add_argument("--replay-max-sleep-ms", type=int, default=0)
     p_rx.add_argument("--replay-timeout-ms", type=int, default=1000)
     p_rx.add_argument("--replay-bulk-in-default-size", type=int, default=32768)
     p_rx.add_argument("--replay-limit", type=int, default=0)
-    p_rx.add_argument("--replay-init-limit", type=int, default=2000)
+    p_rx.add_argument("--replay-init-limit", type=int, default=14500)
     p_rx.add_argument("--replay-no-verify-in", action="store_true")
     p_rx.add_argument("--replay-verify-in-len", action="store_true")
     p_rx.add_argument("--replay-only-rtw-vendor-req", action="store_true")
@@ -2376,11 +2376,11 @@ def main(argv: list[str]) -> int:
     p_scan.add_argument("--replay-mode", choices=("vendor", "all"), default="all")
     p_scan.add_argument("--replay-only", action="store_true")
     p_scan.add_argument("--replay-sleep", action="store_true")
-    p_scan.add_argument("--replay-max-sleep-ms", type=int, default=5)
+    p_scan.add_argument("--replay-max-sleep-ms", type=int, default=0)
     p_scan.add_argument("--replay-timeout-ms", type=int, default=1000)
     p_scan.add_argument("--replay-bulk-in-default-size", type=int, default=32768)
     p_scan.add_argument("--replay-limit", type=int, default=0)
-    p_scan.add_argument("--replay-init-limit", type=int, default=2000)
+    p_scan.add_argument("--replay-init-limit", type=int, default=14500)
     p_scan.add_argument("--replay-no-verify-in", action="store_true")
     p_scan.add_argument("--replay-verify-in-len", action="store_true")
     p_scan.add_argument("--replay-only-rtw-vendor-req", action="store_true")
@@ -2439,11 +2439,11 @@ def main(argv: list[str]) -> int:
     p_deauth_burst.add_argument("--replay-filter", default=None)
     p_deauth_burst.add_argument("--replay-mode", choices=("vendor", "all"), default="all")
     p_deauth_burst.add_argument("--replay-sleep", action="store_true")
-    p_deauth_burst.add_argument("--replay-max-sleep-ms", type=int, default=5)
+    p_deauth_burst.add_argument("--replay-max-sleep-ms", type=int, default=0)
     p_deauth_burst.add_argument("--replay-timeout-ms", type=int, default=1000)
     p_deauth_burst.add_argument("--replay-bulk-in-default-size", type=int, default=32768)
     p_deauth_burst.add_argument("--replay-limit", type=int, default=0)
-    p_deauth_burst.add_argument("--replay-init-limit", type=int, default=2000)
+    p_deauth_burst.add_argument("--replay-init-limit", type=int, default=14500)
     p_deauth_burst.add_argument("--replay-only-rtw-vendor-req", action="store_true")
     p_deauth_burst.add_argument("--replay-report-mismatch", type=int, default=0)
     p_deauth_burst.add_argument("--replay-report-errors", type=int, default=0)
@@ -2616,25 +2616,30 @@ def main(argv: list[str]) -> int:
                 dev.init_mac_rx_tx()
 
             if replay_pcap is not None:
-                if args.replay_mode == "all":
+                replay_limit = int(getattr(args, "replay_init_limit", 0))
+                if replay_limit <= 0:
+                    replay_limit = int(getattr(args, "replay_limit", 0))
+                init_mode = replay_limit > 0
+
+                effective_mode = "vendor" if init_mode else str(getattr(args, "replay_mode", "all"))
+                if effective_mode == "all":
                     default_filter = "usb.urb_type=='S' || usb.urb_type=='C'"
                     display_filter = args.replay_filter or default_filter
-                    replay_limit = int(getattr(args, "replay_init_limit", 0))
-                    if replay_limit <= 0:
-                        replay_limit = int(getattr(args, "replay_limit", 0))
+                    sleep = False if init_mode else bool(args.replay_sleep)
+                    max_sleep_ms = 0 if init_mode else int(args.replay_max_sleep_ms)
                     stats = dev.replay_all_usb_requests_from_pcap(
                         replay_pcap,
                         display_filter=display_filter,
                         timeout_ms=args.replay_timeout_ms,
                         bulk_in_default_size=args.replay_bulk_in_default_size,
-                        sleep=args.replay_sleep,
-                        max_sleep_ms=args.replay_max_sleep_ms,
+                        sleep=sleep,
+                        max_sleep_ms=max_sleep_ms,
                         dry_run=False,
                         limit=int(replay_limit),
                         debug=args.debug,
                         verify_in=not args.replay_no_verify_in,
                         verify_in_mode=("len" if args.replay_verify_in_len else "bytes"),
-                        only_rtw_vendor_req=bool(args.replay_only_rtw_vendor_req),
+                        only_rtw_vendor_req=(True if init_mode else bool(args.replay_only_rtw_vendor_req)),
                         report_mismatch=int(args.replay_report_mismatch),
                         report_errors=int(args.replay_report_errors),
                     )
@@ -2643,16 +2648,13 @@ def main(argv: list[str]) -> int:
                 else:
                     default_filter = "usb.urb_type=='S' && (usb.bmRequestType==0x40 || usb.bmRequestType==0xc0) && usb.setup.bRequest==5"
                     display_filter = args.replay_filter or default_filter
-                    replay_limit = int(getattr(args, "replay_init_limit", 0))
-                    if replay_limit <= 0:
-                        replay_limit = int(getattr(args, "replay_limit", 0))
                     replayed = dev.replay_vendor_requests_from_pcap(
                         replay_pcap,
                         display_filter=display_filter,
                         debug=args.debug,
-                        sleep=args.replay_sleep,
-                        max_sleep_ms=args.replay_max_sleep_ms,
-                        verify_delay_ms=args.replay_verify_delay_ms,
+                        sleep=(False if init_mode else bool(args.replay_sleep)),
+                        max_sleep_ms=(0 if init_mode else int(args.replay_max_sleep_ms)),
+                        verify_delay_ms=(0.0 if init_mode else float(args.replay_verify_delay_ms)),
                         limit=int(replay_limit),
                     )
                     if args.debug:
@@ -2876,25 +2878,30 @@ def main(argv: list[str]) -> int:
                 dev.hw_init_8821au()
 
             if replay_pcap is not None:
-                if args.replay_mode == "all":
+                replay_limit = int(getattr(args, "replay_init_limit", 0))
+                if replay_limit <= 0:
+                    replay_limit = int(getattr(args, "replay_limit", 0))
+                init_mode = replay_limit > 0
+
+                effective_mode = "vendor" if init_mode else str(getattr(args, "replay_mode", "all"))
+                if effective_mode == "all":
                     default_filter = "usb.urb_type=='S' || usb.urb_type=='C'"
                     display_filter = args.replay_filter or default_filter
-                    replay_limit = int(getattr(args, "replay_init_limit", 0))
-                    if replay_limit <= 0:
-                        replay_limit = int(getattr(args, "replay_limit", 0))
+                    sleep = False if init_mode else bool(args.replay_sleep)
+                    max_sleep_ms = 0 if init_mode else int(args.replay_max_sleep_ms)
                     stats = dev.replay_all_usb_requests_from_pcap(
                         replay_pcap,
                         display_filter=display_filter,
                         timeout_ms=args.replay_timeout_ms,
                         bulk_in_default_size=args.replay_bulk_in_default_size,
-                        sleep=args.replay_sleep,
-                        max_sleep_ms=args.replay_max_sleep_ms,
+                        sleep=sleep,
+                        max_sleep_ms=max_sleep_ms,
                         dry_run=False,
                         limit=int(replay_limit),
                         debug=args.debug,
                         verify_in=not args.replay_no_verify_in,
                         verify_in_mode=("len" if args.replay_verify_in_len else "bytes"),
-                        only_rtw_vendor_req=bool(args.replay_only_rtw_vendor_req),
+                        only_rtw_vendor_req=(True if init_mode else bool(args.replay_only_rtw_vendor_req)),
                         report_mismatch=int(args.replay_report_mismatch),
                         report_errors=int(args.replay_report_errors),
                     )
@@ -2903,15 +2910,12 @@ def main(argv: list[str]) -> int:
                 else:
                     default_filter = "usb.urb_type=='S' && (usb.bmRequestType==0x40 || usb.bmRequestType==0xc0) && usb.setup.bRequest==5"
                     display_filter = args.replay_filter or default_filter
-                    replay_limit = int(getattr(args, "replay_init_limit", 0))
-                    if replay_limit <= 0:
-                        replay_limit = int(getattr(args, "replay_limit", 0))
                     replayed = dev.replay_vendor_requests_from_pcap(
                         replay_pcap,
                         display_filter=display_filter,
                         debug=args.debug,
-                        sleep=args.replay_sleep,
-                        max_sleep_ms=args.replay_max_sleep_ms,
+                        sleep=(False if init_mode else bool(args.replay_sleep)),
+                        max_sleep_ms=(0 if init_mode else int(args.replay_max_sleep_ms)),
                         verify_delay_ms=0.0,
                         limit=int(replay_limit),
                     )
@@ -3371,40 +3375,40 @@ def main(argv: list[str]) -> int:
                 dev.init_mac_rx_tx()
 
             if replay_pcap is not None:
-                if args.replay_mode == "all":
+                replay_limit = int(getattr(args, "replay_init_limit", 0))
+                if replay_limit <= 0:
+                    replay_limit = int(getattr(args, "replay_limit", 0))
+                init_mode = replay_limit > 0
+
+                effective_mode = "vendor" if init_mode else str(getattr(args, "replay_mode", "all"))
+                if effective_mode == "all":
                     default_filter = "usb.urb_type=='S' || usb.urb_type=='C'"
                     display_filter = args.replay_filter or default_filter
-                    replay_limit = int(getattr(args, "replay_init_limit", 0))
-                    if replay_limit <= 0:
-                        replay_limit = int(getattr(args, "replay_limit", 0))
                     dev.replay_all_usb_requests_from_pcap(
                         replay_pcap,
                         display_filter=display_filter,
                         timeout_ms=int(args.replay_timeout_ms),
                         bulk_in_default_size=int(args.replay_bulk_in_default_size),
-                        sleep=bool(args.replay_sleep),
-                        max_sleep_ms=int(args.replay_max_sleep_ms),
+                        sleep=(False if init_mode else bool(args.replay_sleep)),
+                        max_sleep_ms=(0 if init_mode else int(args.replay_max_sleep_ms)),
                         dry_run=False,
                         limit=int(replay_limit),
                         debug=False,
                         verify_in=not bool(args.replay_no_verify_in),
                         verify_in_mode=("len" if bool(args.replay_verify_in_len) else "bytes"),
-                        only_rtw_vendor_req=bool(args.replay_only_rtw_vendor_req),
+                        only_rtw_vendor_req=(True if init_mode else bool(args.replay_only_rtw_vendor_req)),
                         report_mismatch=int(args.replay_report_mismatch),
                         report_errors=int(args.replay_report_errors),
                     )
                 else:
                     default_filter = "usb.urb_type=='S' && (usb.bmRequestType==0x40 || usb.bmRequestType==0xc0) && usb.setup.bRequest==5"
                     display_filter = args.replay_filter or default_filter
-                    replay_limit = int(getattr(args, "replay_init_limit", 0))
-                    if replay_limit <= 0:
-                        replay_limit = int(getattr(args, "replay_limit", 0))
                     dev.replay_vendor_requests_from_pcap(
                         replay_pcap,
                         display_filter=display_filter,
                         debug=False,
-                        sleep=bool(args.replay_sleep),
-                        max_sleep_ms=int(args.replay_max_sleep_ms),
+                        sleep=(False if init_mode else bool(args.replay_sleep)),
+                        max_sleep_ms=(0 if init_mode else int(args.replay_max_sleep_ms)),
                         verify_delay_ms=0.0,
                         limit=int(replay_limit),
                     )
