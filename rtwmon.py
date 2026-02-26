@@ -530,7 +530,8 @@ def main(argv: Sequence[str]) -> int:
     p_burst = sub.add_parser("deauth-burst")
     p_burst.add_argument("--channel", type=int, default=1)
     p_burst.add_argument("--bw", type=int, choices=(20, 40, 80), default=20)
-    p_burst.add_argument("--target-mac", required=True)
+    p_burst.add_argument("--target-mac", default="")
+    p_burst.add_argument("--target-macs", default="")
     p_burst.add_argument("--bssid", required=True)
     p_burst.add_argument("--source-mac", default=None)
     p_burst.add_argument("--reason", type=int, default=7)
@@ -805,6 +806,11 @@ def main(argv: Sequence[str]) -> int:
         if getattr(args, "source_mac", None):
             cmd_argv += ["--source-mac", str(getattr(args, "source_mac"))]
     elif args.cmd == "deauth-burst":
+        target_macs = str(getattr(args, "target_macs", "") or "").strip()
+        target_mac = str(getattr(args, "target_mac", "") or "").strip()
+        use_multi = bool(target_macs)
+        if not use_multi and not target_mac:
+            raise RuntimeError("missing --target-mac/--target-macs")
         if driver == "8188eu":
             cmd_argv += [
                 "--deauth-burst",
@@ -812,8 +818,8 @@ def main(argv: Sequence[str]) -> int:
                 str(int(getattr(args, "channel", 1))),
                 "--bw",
                 str(int(getattr(args, "bw", 20))),
-                "--target-mac",
-                str(getattr(args, "target_mac")),
+                ("--target-macs" if use_multi else "--target-mac"),
+                (target_macs if use_multi else target_mac),
                 "--bssid",
                 str(getattr(args, "bssid")),
                 "--reason",
@@ -838,8 +844,8 @@ def main(argv: Sequence[str]) -> int:
                 str(int(getattr(args, "channel", 1))),
                 "--bw",
                 str(int(getattr(args, "bw", 20))),
-                "--target-mac",
-                str(getattr(args, "target_mac")),
+                ("--target-macs" if use_multi else "--target-mac"),
+                (target_macs if use_multi else target_mac),
                 "--bssid",
                 str(getattr(args, "bssid")),
                 "--reason",
