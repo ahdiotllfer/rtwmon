@@ -7,6 +7,7 @@ import sys
 import shlex
 import socket
 import struct
+import time
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, List
 
@@ -449,6 +450,29 @@ def _termux_daemon_get_fd(sock_path: str) -> int:
     return int(fd)
 
 
+def _termux_daemon_start(*, device_path: str, sock_path: str) -> None:
+    py = os.environ.get("PYTHON", "python3")
+    runner = str((Path(__file__).resolve().parent / "termux_usb_run.py").resolve())
+    subprocess.run([py, runner, "--device", str(device_path), "--daemon", "--sock", str(sock_path)], check=False)
+
+
+def _termux_daemon_get_or_start_fd(*, sock_path: str, device_path: str) -> int:
+    try:
+        return _termux_daemon_get_fd(sock_path)
+    except Exception:
+        _termux_daemon_start(device_path=device_path, sock_path=sock_path)
+        last_err: Optional[Exception] = None
+        for _ in range(200):
+            try:
+                return _termux_daemon_get_fd(sock_path)
+            except Exception as e:
+                last_err = e
+                time.sleep(0.05)
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("failed to start daemon")
+
+
 def main(argv: Sequence[str]) -> int:
     argv = list(argv)
     usb_fd_flag_val: Optional[str] = None
@@ -708,7 +732,20 @@ def main(argv: Sequence[str]) -> int:
 
     termux_daemon_sock = str(getattr(args, "termux_daemon_sock", "") or "").strip()
     if usb_fd < 0 and termux_daemon_sock:
-        usb_fd = _termux_daemon_get_fd(termux_daemon_sock)
+        bus = int(getattr(args, "bus", -1))
+        addr = int(getattr(args, "address", -1))
+        device_path: Optional[str] = None
+        if bus >= 0 and addr >= 0:
+            device_path = _termux_usb_device_path(bus, addr)
+        else:
+            try:
+                _drv, _v, _p, _b, _a, sel_path = _termux_select_supported_device()
+                device_path = str(sel_path)
+            except Exception:
+                device_path = None
+        if not device_path:
+            raise RuntimeError("termux daemon sock set but device path is unknown (use --bus/--address)")
+        usb_fd = _termux_daemon_get_or_start_fd(sock_path=termux_daemon_sock, device_path=device_path)
         args.usb_fd = int(usb_fd)
 
     if str(getattr(args, "driver", "auto")) != "auto":
