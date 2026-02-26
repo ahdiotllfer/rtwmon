@@ -3,8 +3,10 @@ import json
 import os
 import socket
 import struct
+import subprocess
 import sys
-from typing import Optional
+import threading
+from typing import Optional, Sequence
  
  
 def _read_usb_fd() -> int:
@@ -17,47 +19,107 @@ def _read_usb_fd() -> int:
     return int(s, 10)
  
  
-def _send_json_with_fd(conn: socket.socket, obj: dict, fd: int) -> None:
-    data = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
-    anc = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", int(fd)))]
-    conn.sendmsg([data], anc)
- 
- 
+def _send_frame(conn: socket.socket, *, kind: bytes, payload: bytes) -> None:
+    conn.sendall(kind + struct.pack("!I", int(len(payload))) + payload)
+
+
 def _send_json(conn: socket.socket, obj: dict) -> None:
-    data = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
-    conn.sendall(data)
- 
- 
-def _handle(conn: socket.socket, *, usb_fd: int) -> bool:
+    _send_frame(conn, kind=b"J", payload=(json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def _read_json_line(conn: socket.socket) -> dict:
     buf = b""
     while b"\n" not in buf:
         chunk = conn.recv(65536)
         if not chunk:
-            return True
+            return {}
         buf += chunk
         if len(buf) > 1024 * 1024:
-            _send_json(conn, {"ok": False, "error": "request too large"})
-            return True
+            return {}
     line = buf.split(b"\n", 1)[0]
     try:
-        req = json.loads(line.decode("utf-8", errors="replace"))
+        v = json.loads(line.decode("utf-8", errors="replace"))
     except Exception:
-        _send_json(conn, {"ok": False, "error": "bad json"})
-        return True
-    if not isinstance(req, dict):
-        _send_json(conn, {"ok": False, "error": "bad request"})
-        return True
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def _replace_usb_fd(argv: Sequence[str], usb_fd: int) -> list[str]:
+    fd_s = str(int(usb_fd))
+    out: list[str] = []
+    for x in argv:
+        out.append(fd_s if x == "{USB_FD}" else str(x))
+    return out
+
+
+def _stream_pipe(pipe, conn: socket.socket, kind: bytes, send_lock: threading.Lock) -> None:
+    try:
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                return
+            if not isinstance(chunk, (bytes, bytearray)):
+                chunk = str(chunk).encode("utf-8", errors="replace")
+            with send_lock:
+                _send_frame(conn, kind=kind, payload=bytes(chunk))
+    except Exception:
+        return
+ 
+ 
+def _handle(conn: socket.socket, *, usb_fd: int) -> bool:
+    req = _read_json_line(conn)
     method = str(req.get("method", "") or "")
     if method == "ping":
         _send_json(conn, {"ok": True, "result": {"pong": True}})
         return True
-    if method == "get_fd":
-        _send_json_with_fd(conn, {"ok": True, "result": {"fd": True}}, int(usb_fd))
-        return True
     if method == "close":
         _send_json(conn, {"ok": True, "result": {"closing": True}})
         return False
-    _send_json(conn, {"ok": False, "error": "unknown method"})
+    if method != "run":
+        _send_json(conn, {"ok": False, "error": "unknown method"})
+        return True
+
+    cmd = req.get("cmd", None)
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        _send_json(conn, {"ok": False, "error": "invalid cmd"})
+        return True
+
+    argv = _replace_usb_fd(cmd, int(usb_fd))
+    env = dict(os.environ)
+    env["RTWMON_TERMUX_USB_FD"] = str(int(usb_fd))
+    try:
+        os.set_inheritable(int(usb_fd), True)
+    except Exception:
+        pass
+
+    send_lock = threading.Lock()
+    try:
+        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, pass_fds=(int(usb_fd),))
+    except Exception as e:
+        _send_json(conn, {"ok": False, "error": str(e)})
+        return True
+
+    _send_json(conn, {"ok": True, "result": {"pid": int(getattr(p, "pid", -1) or -1)}})
+
+    t_out = threading.Thread(target=_stream_pipe, args=(p.stdout, conn, b"O", send_lock), daemon=True)
+    t_err = threading.Thread(target=_stream_pipe, args=(p.stderr, conn, b"E", send_lock), daemon=True)
+    t_out.start()
+    t_err.start()
+    rc = int(p.wait())
+    try:
+        if p.stdout:
+            p.stdout.close()
+    except Exception:
+        pass
+    try:
+        if p.stderr:
+            p.stderr.close()
+    except Exception:
+        pass
+    t_out.join(timeout=1.0)
+    t_err.join(timeout=1.0)
+    with send_lock:
+        _send_frame(conn, kind=b"X", payload=struct.pack("!i", int(rc)))
     return True
  
  

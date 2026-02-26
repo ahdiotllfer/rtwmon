@@ -423,54 +423,78 @@ def _exec_backend(
     return int(r)
 
 
-def _termux_daemon_get_fd(sock_path: str) -> int:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        s.connect(str(sock_path))
-        s.sendall(b'{"method":"get_fd"}\n')
-        data, anc, _flags, _addr = s.recvmsg(65536, socket.CMSG_SPACE(struct.calcsize("i")))
-    finally:
-        try:
-            s.close()
-        except Exception:
-            pass
-    fd: Optional[int] = None
-    for level, ctype, cdata in anc:
-        if level == socket.SOL_SOCKET and ctype == socket.SCM_RIGHTS and len(cdata) >= struct.calcsize("i"):
-            fd = int(struct.unpack("i", cdata[: struct.calcsize("i")])[0])
-            break
-    if fd is None:
-        raise RuntimeError("daemon did not provide a fd")
-    try:
-        obj = json.loads(data.split(b"\n", 1)[0].decode("utf-8", errors="replace"))
-    except Exception:
-        obj = {}
-    if isinstance(obj, dict) and obj.get("ok", True) is False:
-        raise RuntimeError(str(obj.get("error", "daemon error")))
-    return int(fd)
-
-
 def _termux_daemon_start(*, device_path: str, sock_path: str) -> None:
     py = os.environ.get("PYTHON", "python3")
     runner = str((Path(__file__).resolve().parent / "termux_usb_run.py").resolve())
     subprocess.run([py, runner, "--device", str(device_path), "--daemon", "--sock", str(sock_path)], check=False)
 
 
-def _termux_daemon_get_or_start_fd(*, sock_path: str, device_path: str) -> int:
+def _termux_daemon_run(sock_path: str, cmd: Sequence[str]) -> int:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        return _termux_daemon_get_fd(sock_path)
+        s.connect(str(sock_path))
+        req = {"method": "run", "cmd": [str(x) for x in list(cmd)]}
+        s.sendall((json.dumps(req, separators=(",", ":")) + "\n").encode("utf-8"))
+
+        def _read_exact(n: int) -> bytes:
+            buf = b""
+            while len(buf) < n:
+                chunk = s.recv(n - len(buf))
+                if not chunk:
+                    raise RuntimeError("daemon connection closed")
+                buf += chunk
+            return buf
+
+        ok_seen = False
+        while True:
+            kind = _read_exact(1)
+            size = int(struct.unpack("!I", _read_exact(4))[0])
+            payload = _read_exact(size) if size > 0 else b""
+            if kind == b"J":
+                try:
+                    obj = json.loads(payload.decode("utf-8", errors="replace").strip() or "{}")
+                except Exception:
+                    obj = {}
+                if isinstance(obj, dict) and bool(obj.get("ok", True)) is False:
+                    raise RuntimeError(str(obj.get("error", "daemon error")))
+                ok_seen = True
+                continue
+            if kind == b"O":
+                sys.stdout.buffer.write(payload)
+                sys.stdout.buffer.flush()
+                continue
+            if kind == b"E":
+                sys.stderr.buffer.write(payload)
+                sys.stderr.buffer.flush()
+                continue
+            if kind == b"X":
+                if len(payload) != 4:
+                    return 1
+                return int(struct.unpack("!i", payload)[0])
+            if not ok_seen:
+                raise RuntimeError("invalid daemon response")
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _termux_daemon_run_or_start(*, sock_path: str, device_path: str, cmd: Sequence[str]) -> int:
+    try:
+        return _termux_daemon_run(sock_path, cmd)
     except Exception:
         _termux_daemon_start(device_path=device_path, sock_path=sock_path)
         last_err: Optional[Exception] = None
         for _ in range(200):
             try:
-                return _termux_daemon_get_fd(sock_path)
+                return _termux_daemon_run(sock_path, cmd)
             except Exception as e:
                 last_err = e
                 time.sleep(0.05)
         if last_err is not None:
             raise last_err
-        raise RuntimeError("failed to start daemon")
+        raise RuntimeError("failed to run via daemon")
 
 
 def _ctl_call(sock_path: str, req: dict) -> int:
@@ -562,7 +586,14 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--interface", type=int, default=0)
     ap.add_argument("--configuration", type=int, default=1)
     ap.add_argument("--tables-from", type=str, default="")
-    ap.add_argument("--termux-daemon-sock", type=str, default=str(os.environ.get("RTWMON_TERMUX_DAEMON_SOCK", "") or ""))
+    ap.add_argument(
+        "--termux-daemon-sock",
+        type=str,
+        default=str(
+            os.environ.get("RTWMON_TERMUX_DAEMON_SOCK", "")
+            or ("/data/data/com.termux/files/usr/tmp/rtwmon-usb.sock" if _has_termux_api_usb() else "")
+        ),
+    )
     ap.add_argument("--debug", action="store_true")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -800,7 +831,9 @@ def main(argv: Sequence[str]) -> int:
         return 0
 
     termux_daemon_sock = str(getattr(args, "termux_daemon_sock", "") or "").strip()
-    if usb_fd < 0 and termux_daemon_sock:
+    use_termux_daemon = False
+    termux_daemon_device_path: Optional[str] = None
+    if usb_fd < 0 and termux_daemon_sock and _has_termux_api_usb():
         bus = int(getattr(args, "bus", -1))
         addr = int(getattr(args, "address", -1))
         device_path: Optional[str] = None
@@ -814,8 +847,8 @@ def main(argv: Sequence[str]) -> int:
                 device_path = None
         if not device_path:
             raise RuntimeError("termux daemon sock set but device path is unknown (use --bus/--address)")
-        usb_fd = _termux_daemon_get_or_start_fd(sock_path=termux_daemon_sock, device_path=device_path)
-        args.usb_fd = int(usb_fd)
+        use_termux_daemon = True
+        termux_daemon_device_path = str(device_path)
 
     if str(getattr(args, "driver", "auto")) != "auto":
         driver = str(args.driver)
@@ -861,7 +894,9 @@ def main(argv: Sequence[str]) -> int:
         fwd += ["--vid", hex(int(want_vid))]
     if want_pid is not None:
         fwd += ["--pid", hex(int(want_pid))]
-    if usb_fd >= 0:
+    if use_termux_daemon:
+        fwd += ["--usb-fd", "{USB_FD}"]
+    elif usb_fd >= 0:
         fwd += ["--usb-fd", str(int(usb_fd))]
     if driver == "8188eu":
         tables_from = str(getattr(args, "tables_from", "") or "").strip()
@@ -1088,6 +1123,18 @@ def main(argv: Sequence[str]) -> int:
 
     if extra:
         cmd_argv += list(extra)
+
+    if use_termux_daemon and termux_daemon_device_path:
+        if str(prog_abs).endswith(".py"):
+            py = os.environ.get("PYTHON", "python3")
+            full_cmd = [py, "-u", str(prog_abs), *fwd, *cmd_argv]
+        else:
+            full_cmd = [str(prog_abs), *fwd, *cmd_argv]
+        return _termux_daemon_run_or_start(
+            sock_path=str(termux_daemon_sock),
+            device_path=str(termux_daemon_device_path),
+            cmd=full_cmd,
+        )
 
     termux_dev: Optional[str] = None
     termux_vid_pid: Optional[Tuple[int, int]] = None
