@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -291,7 +290,7 @@ def _termux_usb_permission_request(*, device_path: Optional[str] = None, vid: Op
 
 
 def _termux_usb_open_exec(*, device_path: Optional[str] = None, vid: Optional[int] = None, pid: Optional[int] = None, cmd: Sequence[str]) -> int:
-    cmd_str = " ".join(shlex.quote(x) for x in list(cmd))
+    cmd_str = " ".join(str(x) for x in list(cmd))
     if not _has_termux_api_usb():
         return int(subprocess.run(list(cmd)).returncode)
     extra: list[str] = []
@@ -311,7 +310,7 @@ def _termux_usb_open_exec(*, device_path: Optional[str] = None, vid: Optional[in
 def _termux_usb_open_capture(
     *, device_path: Optional[str] = None, vid: Optional[int] = None, pid: Optional[int] = None, cmd: Sequence[str]
 ) -> Optional[str]:
-    cmd_str = " ".join(shlex.quote(x) for x in list(cmd))
+    cmd_str = " ".join(str(x) for x in list(cmd))
     if not _has_termux_api_usb():
         return None
     extra: list[str] = []
@@ -408,23 +407,55 @@ def _exec_backend(
 def main(argv: Sequence[str]) -> int:
     argv = list(argv)
     usb_fd_flag_val: Optional[str] = None
+    bus_flag_val: Optional[str] = None
+    address_flag_val: Optional[str] = None
+    vid_flag_val: Optional[str] = None
+    pid_flag_val: Optional[str] = None
     i = 0
     while i + 1 < len(argv):
         if argv[i] == "--usb-fd":
             usb_fd_flag_val = str(argv[i + 1])
             del argv[i : i + 2]
             continue
+        if argv[i] == "--bus":
+            bus_flag_val = str(argv[i + 1])
+            del argv[i : i + 2]
+            continue
+        if argv[i] == "--address":
+            address_flag_val = str(argv[i + 1])
+            del argv[i : i + 2]
+            continue
+        if argv[i] == "--vid":
+            vid_flag_val = str(argv[i + 1])
+            del argv[i : i + 2]
+            continue
+        if argv[i] == "--pid":
+            pid_flag_val = str(argv[i + 1])
+            del argv[i : i + 2]
+            continue
         i += 1
+
+    prefix: list[str] = []
     if usb_fd_flag_val is not None:
         s = str(usb_fd_flag_val).strip()
         if re.fullmatch(r"[0-9]+", s) is not None:
-            argv = ["--usb-fd", s, *argv]
+            prefix += ["--usb-fd", s]
         else:
             m = re.fullmatch(r"/dev/bus/usb/([0-9]+)/([0-9]+)", s)
             if m:
-                argv = ["--bus", str(int(m.group(1), 10)), "--address", str(int(m.group(2), 10)), *argv]
+                prefix += ["--bus", str(int(m.group(1), 10)), "--address", str(int(m.group(2), 10))]
             else:
-                argv = ["--usb-fd", s, *argv]
+                prefix += ["--usb-fd", s]
+    if bus_flag_val is not None:
+        prefix += ["--bus", str(bus_flag_val).strip()]
+    if address_flag_val is not None:
+        prefix += ["--address", str(address_flag_val).strip()]
+    if vid_flag_val is not None:
+        prefix += ["--vid", str(vid_flag_val).strip()]
+    if pid_flag_val is not None:
+        prefix += ["--pid", str(pid_flag_val).strip()]
+    if prefix:
+        argv = [*prefix, *argv]
     ap = argparse.ArgumentParser(prog="rtwmon")
     ap.add_argument("--driver", choices=tuple(SUPPORTED.keys()) + ("auto",), default="auto")
     ap.add_argument("--vid", type=lambda s: int(s, 0), default=None)
