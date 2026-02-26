@@ -1,11 +1,14 @@
 import argparse
 import binascii
+import json
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 import zlib
 import itertools
@@ -1418,6 +1421,7 @@ def main(argv: list[str]) -> int:
     p_rx.add_argument("--replay-report-mismatch", type=int, default=0)
     p_rx.add_argument("--replay-report-errors", type=int, default=0)
     p_rx.add_argument("--replay-verify-delay-ms", type=float, default=0.0)
+    p_rx.add_argument("--control-sock", default="")
 
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("--fw-path", default=None)
@@ -1690,6 +1694,121 @@ def main(argv: list[str]) -> int:
             if ep_in is None:
                 ep_in = int(dev.bulk_in_eps[0].bEndpointAddress)
  
+            io_lock = threading.Lock()
+            ctrl_stop = threading.Event()
+            ctrl_sock_path = str(getattr(args, "control_sock", "") or "").strip()
+            ctrl_srv: Optional[socket.socket] = None
+
+            def _ctrl_send(conn: socket.socket, obj: object) -> None:
+                try:
+                    data = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
+                except Exception:
+                    data = b'{"ok":false,"error":"encode"}\n'
+                conn.sendall(data)
+
+            def _ctrl_loop() -> None:
+                nonlocal ctrl_srv
+                if not ctrl_sock_path:
+                    return
+                try:
+                    try:
+                        if os.path.exists(ctrl_sock_path):
+                            os.unlink(ctrl_sock_path)
+                    except Exception:
+                        pass
+                    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    ctrl_srv = srv
+                    srv.bind(ctrl_sock_path)
+                    try:
+                        os.chmod(ctrl_sock_path, 0o600)
+                    except Exception:
+                        pass
+                    srv.listen(8)
+                    srv.settimeout(0.2)
+                except Exception:
+                    return
+
+                while not ctrl_stop.is_set():
+                    try:
+                        conn, _ = srv.accept()
+                    except socket.timeout:
+                        continue
+                    except Exception:
+                        break
+                    try:
+                        conn.settimeout(1.0)
+                        buf = b""
+                        while b"\n" not in buf and len(buf) < 65536:
+                            chunk = conn.recv(4096)
+                            if not chunk:
+                                break
+                            buf += chunk
+                        line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+                        try:
+                            req = json.loads(line) if line else {}
+                        except Exception:
+                            req = {}
+                        if not isinstance(req, dict):
+                            req = {}
+                        method = str(req.get("method", "") or "")
+
+                        if method == "ping":
+                            _ctrl_send(conn, {"ok": True, "result": {"pong": True}})
+                            continue
+                        if method == "stop":
+                            ctrl_stop.set()
+                            _ctrl_send(conn, {"ok": True, "result": {"stopping": True}})
+                            continue
+                        if method == "set_channel":
+                            ch = int(req.get("channel", 1) or 1)
+                            bw = int(req.get("bw", int(args.bw)) or int(args.bw))
+                            with io_lock:
+                                dev.set_channel(ch, bandwidth_mhz=bw)
+                            _ctrl_send(conn, {"ok": True, "result": {"channel": ch, "bw": bw}})
+                            continue
+                        if method == "deauth":
+                            bssid = str(req.get("bssid", "") or "")
+                            dest = str(req.get("target_mac", "") or "")
+                            source = req.get("source_mac", None)
+                            source_s = str(source) if source is not None else None
+                            reason = int(req.get("reason", 7) or 7)
+                            count = int(req.get("count", 1) or 1)
+                            delay_ms = int(req.get("delay_ms", 0) or 0)
+                            sent = 0
+                            for i in range(max(0, count)):
+                                with io_lock:
+                                    dev.send_deauth(dest=dest, bssid=bssid, source=source_s, reason=reason, ep_out=None)
+                                sent += 1
+                                if delay_ms > 0 and i + 1 < count:
+                                    time.sleep(float(delay_ms) / 1000.0)
+                            _ctrl_send(conn, {"ok": True, "result": {"sent": sent}})
+                            continue
+
+                        _ctrl_send(conn, {"ok": False, "error": "unknown method"})
+                    except Exception as e:
+                        try:
+                            _ctrl_send(conn, {"ok": False, "error": str(e)})
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+                try:
+                    if ctrl_sock_path and os.path.exists(ctrl_sock_path):
+                        os.unlink(ctrl_sock_path)
+                except Exception:
+                    pass
+
+            if ctrl_sock_path:
+                threading.Thread(target=_ctrl_loop, daemon=True).start()
+
             seen = 0
             reads = 0
             t0 = time.monotonic()
@@ -1701,7 +1820,8 @@ def main(argv: list[str]) -> int:
                     fp = sys.stdout.buffer if p == "-" else open(p, "wb")
                     pcap = PcapWriter(fp)
                 while True:
-                    raw = dev.bulk_read_ep(int(ep_in), size=int(args.size), timeout_ms=int(args.timeout_ms))
+                    with io_lock:
+                        raw = dev.bulk_read_ep(int(ep_in), size=int(args.size), timeout_ms=int(args.timeout_ms))
                     reads += 1
                     if args.max_reads and reads >= int(args.max_reads):
                         return 1 if seen == 0 else 0
@@ -1755,6 +1875,18 @@ def main(argv: list[str]) -> int:
                         if int(args.limit) > 0 and seen >= int(args.limit):
                             return 0
             finally:
+                ctrl_stop.set()
+                if ctrl_srv is not None:
+                    try:
+                        ctrl_srv.close()
+                    except Exception:
+                        pass
+                if ctrl_sock_path:
+                    try:
+                        if os.path.exists(ctrl_sock_path):
+                            os.unlink(ctrl_sock_path)
+                    except Exception:
+                        pass
                 if pcap is not None:
                     pcap.flush()
                 if fp is not None and fp is not sys.stdout.buffer:

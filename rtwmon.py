@@ -473,6 +473,33 @@ def _termux_daemon_get_or_start_fd(*, sock_path: str, device_path: str) -> int:
         raise RuntimeError("failed to start daemon")
 
 
+def _ctl_call(sock_path: str, req: dict) -> int:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(sock_path))
+        s.sendall((json.dumps(req, separators=(",", ":")) + "\n").encode("utf-8"))
+        buf = b""
+        while b"\n" not in buf and len(buf) < 65536:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+        sys.stdout.write(line + "\n")
+        try:
+            obj = json.loads(line) if line else {}
+        except Exception:
+            obj = {}
+        if isinstance(obj, dict) and bool(obj.get("ok", True)) is False:
+            return 1
+        return 0
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def main(argv: Sequence[str]) -> int:
     argv = list(argv)
     usb_fd_flag_val: Optional[str] = None
@@ -553,6 +580,22 @@ def main(argv: Sequence[str]) -> int:
     p_tm.add_argument("--device", default="")
     p_tm.add_argument("--auto", action="store_true")
     p_tm.add_argument("cmd", nargs=argparse.REMAINDER)
+
+    p_ctl = sub.add_parser("ctl")
+    p_ctl.add_argument("--sock", required=True)
+    ctl_sub = p_ctl.add_subparsers(dest="ctl_cmd", required=True)
+    ctl_sub.add_parser("ping")
+    ctl_stop = ctl_sub.add_parser("stop")
+    ctl_setch = ctl_sub.add_parser("set-channel")
+    ctl_setch.add_argument("--channel", type=int, required=True)
+    ctl_setch.add_argument("--bw", type=int, default=20)
+    ctl_deauth = ctl_sub.add_parser("deauth")
+    ctl_deauth.add_argument("--bssid", required=True)
+    ctl_deauth.add_argument("--target-mac", required=True)
+    ctl_deauth.add_argument("--source-mac", default=None)
+    ctl_deauth.add_argument("--reason", type=int, default=7)
+    ctl_deauth.add_argument("--count", type=int, default=1)
+    ctl_deauth.add_argument("--delay-ms", type=int, default=0)
 
     p_scan = sub.add_parser("scan")
     p_scan.add_argument("--channels", default="1-11")
@@ -643,6 +686,32 @@ def main(argv: Sequence[str]) -> int:
         if bool(getattr(args, "auto", False)):
             cmd.append("--auto")
         return int(subprocess.run(cmd).returncode)
+
+    if args.cmd == "ctl":
+        sock_path = str(getattr(args, "sock", "") or "").strip()
+        ctl_cmd = str(getattr(args, "ctl_cmd", "") or "")
+        if ctl_cmd == "ping":
+            return _ctl_call(sock_path, {"method": "ping"})
+        if ctl_cmd == "stop":
+            return _ctl_call(sock_path, {"method": "stop"})
+        if ctl_cmd == "set-channel":
+            return _ctl_call(
+                sock_path,
+                {"method": "set_channel", "channel": int(getattr(args, "channel", 1)), "bw": int(getattr(args, "bw", 20))},
+            )
+        if ctl_cmd == "deauth":
+            req = {
+                "method": "deauth",
+                "bssid": str(getattr(args, "bssid")),
+                "target_mac": str(getattr(args, "target_mac")),
+                "reason": int(getattr(args, "reason", 7)),
+                "count": int(getattr(args, "count", 1)),
+                "delay_ms": int(getattr(args, "delay_ms", 0)),
+            }
+            if getattr(args, "source_mac", None):
+                req["source_mac"] = str(getattr(args, "source_mac"))
+            return _ctl_call(sock_path, req)
+        raise RuntimeError("unknown ctl command")
 
     if args.cmd == "termux-multi":
         cmd = list(getattr(args, "cmd", []) or [])
