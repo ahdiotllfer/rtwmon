@@ -6,6 +6,8 @@ import struct
 import subprocess
 import sys
 import threading
+import time
+import signal
 from typing import Optional, Sequence
  
  
@@ -153,6 +155,7 @@ def _handle(conn: socket.socket, *, usb_fd: int) -> bool:
         pass
 
     send_lock = threading.Lock()
+    stop_event = threading.Event()
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, pass_fds=(int(usb_fd),))
     except Exception as e:
@@ -161,11 +164,64 @@ def _handle(conn: socket.socket, *, usb_fd: int) -> bool:
 
     _send_json(conn, {"ok": True, "result": {"pid": int(getattr(p, "pid", -1) or -1)}})
 
-    t_out = threading.Thread(target=_stream_pipe, args=(p.stdout, conn, b"O", send_lock), daemon=True)
-    t_err = threading.Thread(target=_stream_pipe, args=(p.stderr, conn, b"E", send_lock), daemon=True)
+    def _stream(pipe, kind: bytes) -> None:
+        try:
+            while True:
+                if stop_event.is_set():
+                    return
+                chunk = pipe.read(4096)
+                if not chunk:
+                    return
+                if not isinstance(chunk, (bytes, bytearray)):
+                    chunk = str(chunk).encode("utf-8", errors="replace")
+                with send_lock:
+                    _send_frame(conn, kind=kind, payload=bytes(chunk))
+        except Exception:
+            stop_event.set()
+            return
+
+    t_out = threading.Thread(target=_stream, args=(p.stdout, b"O"), daemon=True)
+    t_err = threading.Thread(target=_stream, args=(p.stderr, b"E"), daemon=True)
     t_out.start()
     t_err.start()
-    rc = int(p.wait())
+    rc: Optional[int] = None
+    while True:
+        polled = p.poll()
+        if polled is not None:
+            rc = int(polled)
+            break
+        if stop_event.is_set():
+            try:
+                p.send_signal(signal.SIGINT)
+            except Exception:
+                pass
+            t_deadline = time.monotonic() + 0.8
+            while time.monotonic() < t_deadline:
+                polled2 = p.poll()
+                if polled2 is not None:
+                    rc = int(polled2)
+                    break
+                time.sleep(0.05)
+            if rc is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+                t_deadline2 = time.monotonic() + 0.8
+                while time.monotonic() < t_deadline2:
+                    polled3 = p.poll()
+                    if polled3 is not None:
+                        rc = int(polled3)
+                        break
+                    time.sleep(0.05)
+            if rc is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                rc = int(p.wait())
+            break
+        time.sleep(0.05)
     try:
         if p.stdout:
             p.stdout.close()
@@ -179,7 +235,10 @@ def _handle(conn: socket.socket, *, usb_fd: int) -> bool:
     t_out.join(timeout=1.0)
     t_err.join(timeout=1.0)
     with send_lock:
-        _send_frame(conn, kind=b"X", payload=struct.pack("!i", int(rc)))
+        try:
+            _send_frame(conn, kind=b"X", payload=struct.pack("!i", int(rc if rc is not None else 1)))
+        except Exception:
+            pass
     return True
  
  
