@@ -305,7 +305,6 @@ def _termux_usb_open_exec(*, device_path: Optional[str] = None, vid: Optional[in
         return 1
     env = dict(os.environ)
     env["TERMUX_CALLBACK"] = cmd_str
-    env["TERMUX_EXPORT_FD"] = "true"
     return int(subprocess.run([_termux_api_bin(), "Usb", "-a", "open", *extra], env=env).returncode)
 
 
@@ -326,7 +325,6 @@ def _termux_usb_open_capture(
         return None
     env = dict(os.environ)
     env["TERMUX_CALLBACK"] = cmd_str
-    env["TERMUX_EXPORT_FD"] = "true"
     try:
         return subprocess.check_output(
             [_termux_api_bin(), "Usb", "-a", "open", *extra],
@@ -409,6 +407,24 @@ def _exec_backend(
 
 def main(argv: Sequence[str]) -> int:
     argv = list(argv)
+    usb_fd_flag_val: Optional[str] = None
+    i = 0
+    while i + 1 < len(argv):
+        if argv[i] == "--usb-fd":
+            usb_fd_flag_val = str(argv[i + 1])
+            del argv[i : i + 2]
+            continue
+        i += 1
+    if usb_fd_flag_val is not None:
+        s = str(usb_fd_flag_val).strip()
+        if re.fullmatch(r"[0-9]+", s) is not None:
+            argv = ["--usb-fd", s, *argv]
+        else:
+            m = re.fullmatch(r"/dev/bus/usb/([0-9]+)/([0-9]+)", s)
+            if m:
+                argv = ["--bus", str(int(m.group(1), 10)), "--address", str(int(m.group(2), 10)), *argv]
+            else:
+                argv = ["--usb-fd", s, *argv]
     ap = argparse.ArgumentParser(prog="rtwmon")
     ap.add_argument("--driver", choices=tuple(SUPPORTED.keys()) + ("auto",), default="auto")
     ap.add_argument("--vid", type=lambda s: int(s, 0), default=None)
