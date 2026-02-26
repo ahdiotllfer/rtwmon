@@ -3219,7 +3219,7 @@ def main(argv: list[str]) -> int:
                             key = (bssid, ssid)
                             prev = results.get(key)
                             if prev is None:
-                                row = {
+                                results[key] = {
                                     "bssid": bssid, 
                                     "ssid": ssid, 
                                     "channel": ch_eff, 
@@ -3228,23 +3228,7 @@ def main(argv: list[str]) -> int:
                                     "wpa": info['wpa'],
                                     "wpa2": info['wpa2']
                                 }
-                                results[key] = row
                                 ch_new += 1
-                                target = str(args.target_ssid).strip()
-                                if (not target) or (str(ssid).strip() == target):
-                                    ssid_out = str(ssid)
-                                    if ssid_out == "":
-                                        ssid_out = "<hidden>"
-                                    enc = "OPEN"
-                                    if row.get("privacy"):
-                                        if row.get("wpa2"):
-                                            enc = "WPA2"
-                                        elif row.get("wpa"):
-                                            enc = "WPA"
-                                        else:
-                                            enc = "WEP"
-                                    print(f"ch={int(ch_eff):02d} bssid={bssid} seen=1 enc={enc} ssid={ssid_out}")
-                                    sys.stdout.flush()
                             else:
                                 prev["seen"] = int(prev["seen"]) + 1
 
@@ -3259,6 +3243,24 @@ def main(argv: list[str]) -> int:
                         f"[scan] ch={int(ch):03d} urbs={ch_urbs} bytes={ch_bytes} pkts={ch_pkts}"
                         f" mgmt={ch_mgmt} bcn={ch_bcn} prb={ch_prb} new={ch_new}"
                     )
+
+                if not args.target_ssid:
+                    rows_rt = list(results.values())
+                    rows_rt.sort(key=lambda r: (int(r["channel"]), str(r["ssid"])))
+                    for r in rows_rt:
+                        ssid = str(r["ssid"])
+                        if ssid == "":
+                            ssid = "<hidden>"
+                        enc = "OPEN"
+                        if r.get("privacy"):
+                            if r.get("wpa2"):
+                                enc = "WPA2"
+                            elif r.get("wpa"):
+                                enc = "WPA"
+                            else:
+                                enc = "WEP"
+                        print(f"ch={int(r['channel']):02d} bssid={r['bssid']} seen={int(r['seen'])} enc={enc} ssid={ssid}")
+                    sys.stdout.flush()
 
             rows = list(results.values())
             if args.target_ssid:
