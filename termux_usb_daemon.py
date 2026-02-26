@@ -19,6 +19,61 @@ def _read_usb_fd() -> int:
     return int(s, 10)
  
  
+def _libusb_error_name(lib: object, code: int) -> str:
+    try:
+        f = getattr(lib, "libusb_error_name", None)
+        if f is None:
+            return str(int(code))
+        import ctypes
+
+        f.argtypes = [ctypes.c_int]
+        f.restype = ctypes.c_char_p
+        s = f(int(code))
+        if isinstance(s, (bytes, bytearray)):
+            return s.decode("utf-8", errors="replace")
+        if s is None:
+            return str(int(code))
+        return str(s)
+    except Exception:
+        return str(int(code))
+
+
+def _validate_usb_fd(usb_fd: int) -> Optional[str]:
+    try:
+        import ctypes
+        import usb.backend.libusb1 as libusb1
+    except Exception:
+        return None
+
+    def _find_libusb1(name):
+        p = os.environ.get("LIBUSB_PATH")
+        if p:
+            return str(p)
+        termux = "/data/data/com.termux/files/usr/lib/libusb-1.0.so"
+        if os.path.isfile(termux):
+            return termux
+        if name:
+            return name
+        return None
+
+    backend = libusb1.get_backend(find_library=_find_libusb1)
+    if backend is None:
+        return "libusb backend not available"
+    lib = backend.lib
+
+    wrap = getattr(lib, "libusb_wrap_sys_device", None)
+    if wrap is None:
+        return "libusb_wrap_sys_device not available"
+    wrap.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    wrap.restype = ctypes.c_int
+
+    handle = ctypes.c_void_p()
+    r = int(wrap(backend.ctx, ctypes.c_void_p(int(usb_fd)), ctypes.byref(handle)))
+    if r != 0 or not handle:
+        return f"libusb_wrap_sys_device failed: {_libusb_error_name(lib, r)}"
+    return None
+
+ 
 def _send_frame(conn: socket.socket, *, kind: bytes, payload: bytes) -> None:
     conn.sendall(kind + struct.pack("!I", int(len(payload))) + payload)
 
@@ -78,6 +133,11 @@ def _handle(conn: socket.socket, *, usb_fd: int) -> bool:
     if method != "run":
         _send_json(conn, {"ok": False, "error": "unknown method"})
         return True
+
+    err = _validate_usb_fd(int(usb_fd))
+    if err:
+        _send_json(conn, {"ok": False, "error": err})
+        return False
 
     cmd = req.get("cmd", None)
     if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
