@@ -302,9 +302,8 @@ def _termux_usb_open_exec(*, device_path: Optional[str] = None, vid: Optional[in
     if not _termux_usb_permission_request(device_path=device_path, vid=vid, pid=pid):
         return 1
     env = dict(os.environ)
-    cb = str((Path(__file__).resolve().parent / "rtwmon_termux_callback.py").resolve())
-    env["TERMUX_CALLBACK"] = f"{os.environ.get('PYTHON', 'python3')} {cb}"
-    env["RTWMON_TERMUX_CALLBACK_JSON"] = json.dumps([str(x) for x in list(cmd)])
+    env["TERMUX_CALLBACK"] = " ".join(str(x) for x in list(cmd))
+    env["TERMUX_EXPORT_FD"] = "true"
     return int(subprocess.run([_termux_api_bin(), "Usb", "-a", "open", *extra], env=env).returncode)
 
 
@@ -323,9 +322,8 @@ def _termux_usb_open_capture(
     if not _termux_usb_permission_request(device_path=device_path, vid=vid, pid=pid):
         return None
     env = dict(os.environ)
-    cb = str((Path(__file__).resolve().parent / "rtwmon_termux_callback.py").resolve())
-    env["TERMUX_CALLBACK"] = f"{os.environ.get('PYTHON', 'python3')} {cb}"
-    env["RTWMON_TERMUX_CALLBACK_JSON"] = json.dumps([str(x) for x in list(cmd)])
+    env["TERMUX_CALLBACK"] = " ".join(str(x) for x in list(cmd))
+    env["TERMUX_EXPORT_FD"] = "true"
     try:
         return subprocess.check_output(
             [_termux_api_bin(), "Usb", "-a", "open", *extra],

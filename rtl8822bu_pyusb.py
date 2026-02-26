@@ -1567,6 +1567,11 @@ def main(argv: list[str]) -> int:
         else:
             ap.error("unrecognized arguments: " + " ".join(extra))
 
+    if int(getattr(args, "usb_fd", -1)) < 0:
+        env_fd = os.environ.get("TERMUX_USB_FD") or os.environ.get("RTWMON_TERMUX_USB_FD")
+        if env_fd is not None and re.fullmatch(r"[0-9]+", str(env_fd).strip() or "") is not None:
+            args.usb_fd = int(str(env_fd).strip(), 10)
+
     if args.cmd == "scan" and _is_termux() and not bool(getattr(args, "target_ssid", "")) and not bool(getattr(args, "forever", False)):
         args.forever = True
  
