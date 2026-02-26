@@ -2083,6 +2083,24 @@ def main(argv: list[str]) -> int:
                                     "wpa2": info['wpa2'],
                                 }
                                 results[bssid_s] = rec
+                                if not target_ssid:
+                                    ssid_out = str(ssid or "")
+                                    if ssid_out == "":
+                                        ssid_out = "<hidden>"
+                                    ds_ch_out = int(ch_ie) if ch_ie is not None else 0
+                                    tuned_ch_out = int(tuned_ch)
+                                    enc = "OPEN"
+                                    if rec.get("privacy"):
+                                        if rec.get("wpa2"):
+                                            enc = "WPA2"
+                                        elif rec.get("wpa"):
+                                            enc = "WPA"
+                                        else:
+                                            enc = "WEP"
+                                    sys.stdout.write(
+                                        f"ds={ds_ch_out:02d} tuned={tuned_ch_out:02d} bssid={str(rec.get('bssid', ''))} seen=1 enc={enc} ssid={ssid_out}\n"
+                                    )
+                                    sys.stdout.flush()
                             rec["seen"] = int(rec.get("seen", 0)) + 1
                             if ssid is not None and ssid != "":
                                 rec["ssid"] = ssid
@@ -2122,27 +2140,6 @@ def main(argv: list[str]) -> int:
                                 if bool(args.pcap_include_bad_fcs) or not (pkt.crc_err or pkt.icv_err):
                                     pcap.write_packet(rtap + out_frame)
                     
-                    if not target_ssid:
-                        rows_rt = list(results.values())
-                        rows_rt.sort(key=lambda r: (_best_channel(r.get("ds_counts")), _best_channel(r.get("tuned_counts")), str(r.get("ssid", ""))))
-                        for r in rows_rt:
-                            ssid = str(r.get("ssid", ""))
-                            if ssid == "":
-                                ssid = "<hidden>"
-                            ds_ch = _best_channel(r.get("ds_counts"))
-                            tuned_ch = _best_channel(r.get("tuned_counts"))
-                            enc = "OPEN"
-                            if r.get("privacy"):
-                                if r.get("wpa2"):
-                                    enc = "WPA2"
-                                elif r.get("wpa"):
-                                    enc = "WPA"
-                                else:
-                                    enc = "WEP"
-                            sys.stdout.write(
-                                f"ds={ds_ch:02d} tuned={tuned_ch:02d} bssid={str(r.get('bssid', ''))} seen={int(r.get('seen', 0))} enc={enc} ssid={ssid}\n"
-                            )
-                        sys.stdout.flush()
             finally:
                 if pcap is not None:
                     pcap.flush()
