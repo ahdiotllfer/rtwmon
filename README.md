@@ -21,7 +21,6 @@
 
 - Python 3
 - PyUSB (`pip install pyusb`)
-- Firmware file `rtl8188eufw.bin` (auto-searched in common locations, or pass `--firmware`)
 
 ## Usage
 
@@ -36,7 +35,7 @@ python3 rtwmon.py scan --channels 1-11
 Termux (no root): pass the USB device through `termux-usb`; the wrapper accepts a trailing numeric FD:
 
 ```bash
-termux-usb -e "python3 rtwmon.py scan --channels 1-11" /dev/bus/usb/001/003
+python3 termux_usb_run.py -- rtwmon.py scan --channels 1-11
 ```
 
 Select a backend explicitly:
@@ -51,7 +50,7 @@ python3 rtwmon.py --driver 8822bu scan --channels 1-13
 - RTL8821AU: `rtl8821au_pyusb.py`
 - RTL8822BU: `rtl8822bu_pyusb.py`
 
-### RTL8188EU (PyUSB) legacy CLI
+### RTL8188EU (PyUSB) CLI
 
 `rtl8188eu_pyusb.py` is a Python userspace tool that talks to an RTL8188EU USB Wi‑Fi device via PyUSB:
 
